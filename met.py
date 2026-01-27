@@ -1,42 +1,44 @@
+"""
+Minimum Excitation Time (MET) scanning for single-qubit excitation optimization.
+
+This module implements binary-search-like MET finding with multiple initialization
+attempts and optimization schedule control.
+"""
+
 from __future__ import annotations
 
-import json
 import os
 import logging
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Dict, Any
 
 import numpy as np
+from tqdm import tqdm
+
+from .dataclasses import SimulationConfig, SQEResults
+from .sqe_optimisation import sqe_optimisation
 
 
-# ======================================================
-# Global suppression of TensorFlow / absl warnings
-#   - Works even if TF was imported earlier (we reconfigure loggers)
-#   - Also blocks C++ backend logs via TF_CPP_MIN_LOG_LEVEL
-# ======================================================
+# ============================================================================
+# Suppress TensorFlow and optimization noise
+# ============================================================================
 
 def _suppress_tensorflow_noise() -> None:
-    # C++/backend TF logs (0=all, 1=INFO, 2=WARNING, 3=ERROR)
+    """Suppress TensorFlow and absl logging."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-
-    # Python logging channels
     logging.getLogger("tensorflow").setLevel(logging.ERROR)
     logging.getLogger("absl").setLevel(logging.ERROR)
 
-    # Some TF builds use absl.logging directly
     try:
-        from absl import logging as absl_logging  # type: ignore
+        from absl import logging as absl_logging
         absl_logging.set_verbosity(absl_logging.ERROR)
         absl_logging.set_stderrthreshold("error")
     except Exception:
         pass
 
-    # If tensorflow is available (or already imported), clamp its logger too
     try:
-        import tensorflow as tf  # type: ignore
-
+        import tensorflow as tf
         try:
             tf.get_logger().setLevel("ERROR")
             tf.get_logger().propagate = False
@@ -48,301 +50,244 @@ def _suppress_tensorflow_noise() -> None:
         except Exception:
             pass
     except Exception:
-        # If TF isn't installed in some environments, fine.
         pass
 
 
 _suppress_tensorflow_noise()
 
 
-from .dataclasses import SimulationConfig
-from .optimisation import SQEOptimisation
-
-
-# ======================================================
-# Helper: pulse init policy
-# ======================================================
-
-def pulse_init_scale_for_theta(
-    theta: float,
-    cutoff: float,
-    scale_zero: float,
-    scale_random: float,
-) -> float:
-    return scale_zero if abs(theta) <= cutoff else scale_random
-
-
-# ======================================================
-# Helper: safe extraction for saving
-# ======================================================
-
-def _maybe_to_numpy(x: Any) -> Optional[np.ndarray]:
-    if x is None:
-        return None
-    if isinstance(x, np.ndarray):
-        return x
-    try:
-        return np.asarray(x)
-    except Exception:
-        return None
-
-
-def _results_to_save_payload(results: Any) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-
-    # Small JSON-safe fields
-    for k in ["I_final", "n_iter", "converged", "success"]:
-        if hasattr(results, k):
-            v = getattr(results, k)
-            if isinstance(v, (int, float, bool, str)) or v is None:
-                payload[k] = v
-
-    # Candidate arrays saved to npz (best-effort)
-    array_candidates = [
-        "pulse",
-        "pulse_x",
-        "pulse_y",
-        "pulse_z",
-        "t",
-        "time",
-        "times",
-        "psi_t",
-        "state_traj",
-        "state_trajectory",
-        "rho_t",
-        "density_traj",
-        "entropy_t",
-        "S_t",
-        "entanglement_entropy_t",
-    ]
-
-    arrays: Dict[str, np.ndarray] = {}
-    for k in array_candidates:
-        if hasattr(results, k):
-            arr = _maybe_to_numpy(getattr(results, k))
-            if arr is not None:
-                arrays[k] = arr
-
-    payload["_arrays_present"] = sorted(arrays.keys())
-    payload["_arrays"] = arrays  # caller must pop before json dump
-    return payload
-
-
-def _jsonable_cfg(cfg: Any) -> Dict[str, Any]:
-    if is_dataclass(cfg):
-        return asdict(cfg)
-    if hasattr(cfg, "__dict__"):
-        return dict(cfg.__dict__)
-    return {"repr": repr(cfg)}
-
-
-# ======================================================
-# Storage manager
-# ======================================================
-
-class METStorage:
-    """
-    Layout:
-      root/
-        meta.json
-        I_1e-06/
-          met_table.npz
-          theta_000_theta0.000000/
-            run_000/
-              summary.json
-              cfg.json
-              arrays.npz
-            ...
-    """
-
-    def __init__(self, root: Union[str, Path]):
-        self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-
-    def _thr_dir(self, infidelity_threshold: float) -> Path:
-        name = f"I_{infidelity_threshold:.0e}".replace("+", "")
-        p = self.root / name
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    def _theta_dir(self, thr_dir: Path, theta_idx: int, theta: float) -> Path:
-        p = thr_dir / f"theta_{theta_idx:03d}_theta{theta:.6f}"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    def _run_dir(self, theta_dir: Path, run_idx: int) -> Path:
-        p = theta_dir / f"run_{run_idx:03d}"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    def write_root_meta(self, meta: Dict[str, Any]) -> None:
-        with (self.root / "meta.json").open("w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, sort_keys=True)
-
-    def write_run_result(
-        self,
-        *,
-        infidelity_threshold: float,
-        theta_idx: int,
-        theta: float,
-        run_idx: int,
-        summary: Dict[str, Any],
-        cfg: Optional[Any] = None,
-        arrays: Optional[Dict[str, np.ndarray]] = None,
-    ) -> None:
-        thr_dir = self._thr_dir(infidelity_threshold)
-        theta_dir = self._theta_dir(thr_dir, theta_idx, theta)
-        run_dir = self._run_dir(theta_dir, run_idx)
-
-        with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
-
-        if cfg is not None:
-            with (run_dir / "cfg.json").open("w", encoding="utf-8") as f:
-                json.dump(_jsonable_cfg(cfg), f, indent=2, sort_keys=True)
-
-        if arrays:
-            np.savez_compressed(run_dir / "arrays.npz", **arrays)
-
-    def write_threshold_table(
-        self,
-        *,
-        infidelity_threshold: float,
-        theta_values: np.ndarray,
-        MET_runs: np.ndarray,     # (n_theta, n_runs)
-        MET_mean: np.ndarray,     # (n_theta,)
-        MET_std: np.ndarray,      # (n_theta,)
-    ) -> None:
-        thr_dir = self._thr_dir(infidelity_threshold)
-        np.savez_compressed(
-            thr_dir / "met_table.npz",
-            theta_values=np.asarray(theta_values, dtype=float),
-            MET_runs=np.asarray(MET_runs, dtype=float),
-            MET_mean=np.asarray(MET_mean, dtype=float),
-            MET_std=np.asarray(MET_std, dtype=float),
-        )
-
-
-# ======================================================
-# Hard silence (stdout/stderr) for optimisation
-# ======================================================
+# ============================================================================
+# Silent execution wrapper
+# ============================================================================
 
 class _NullWriter:
+    """Dummy writer that discards all output."""
     def write(self, _: str) -> int:
         return 0
     def flush(self) -> None:
-        return None
+        pass
 
 
-def _run_optimisation_silently(fn):
+def _run_silently(fn):
+    """Run function with stdout/stderr suppressed."""
     with redirect_stdout(_NullWriter()), redirect_stderr(_NullWriter()):
         return fn()
 
 
-# ======================================================
-# One optimisation attempt (silent by default)
-# ======================================================
+# ============================================================================
+# Single optimization attempt
+# ============================================================================
 
-def _single_attempt(
-    *,
-    theta: float,
-    T_ns: float,
+def _single_optimization_attempt(
+    config: SimulationConfig,
     infidelity_threshold: float,
-    attempt_idx: int,
-    seed: Optional[int],
-    cfg_kwargs: dict,
-    pulse_init_scale: float,
     suppress_output: bool = True,
-) -> Dict[str, Any]:
-    cfg = SimulationConfig(
-        theta=theta,
-        T_ns=T_ns,
-        infidelity_threshold=infidelity_threshold,
-        pulse_init_scale=pulse_init_scale,
-        seed=seed,
-        **cfg_kwargs,
-    )
+    min_gtol_factor: float = 100.0,
+) -> Tuple[bool, SQEResults]:
+    """
+    Run optimization with automatic gtol reduction if needed.
 
-    opt = SQEOptimisation(cfg)
-    if suppress_output:
-        results = _run_optimisation_silently(opt.optimise)
-    else:
-        results = opt.optimise()
+    If the optimization fails because gtol is reached but gradient is still large
+    (indicating early stopping), this function automatically reduces gtol and retries.
 
-    I_final = float(getattr(results, "I_final", np.inf))
-    ok = (I_final <= infidelity_threshold)
+    Parameters
+    ----------
+    config : SimulationConfig
+        Configuration for the optimization. The gtol field will be used and
+        potentially modified if retries are needed.
+    infidelity_threshold : float
+        Target infidelity threshold for success.
+    suppress_output : bool
+        Whether to suppress optimization output.
+    min_gtol_factor : float
+        Don't reduce gtol more than this factor below the infidelity threshold.
+        Default is 100 (so min_gtol = infidelity_threshold / 100).
 
-    return dict(
-        ok=ok,
-        I_final=I_final,
-        results=results,
-        cfg=cfg,
-        seed=seed,
-        attempt_idx=int(attempt_idx),
-    )
+    Returns
+    -------
+    success : bool
+        Whether the optimization succeeded (final infidelity <= threshold).
+    results : SQEResults
+        Full optimization results from the last attempt.
+    """
+    from dataclasses import replace
+
+    min_gtol = infidelity_threshold / min_gtol_factor
+    attempt = 0
+    max_attempts = 10  # Prevent infinite loops
+    current_config = config
+
+    while attempt < max_attempts:
+        attempt += 1
+
+        # Run optimization with current config
+        if suppress_output:
+            results = _run_silently(lambda: sqe_optimisation(current_config))
+        else:
+            results = sqe_optimisation(current_config)
+
+        # Check if final infidelity meets threshold
+        final_infidelity = float(results.val_final[-1])
+        success = final_infidelity <= infidelity_threshold
+
+        if success:
+            return True, results
+
+        # Failed - check if we should retry with smaller gtol
+        # Only retry if gradient is still large (indicates gtol stopped us early)
+        if results.gradient_norm > infidelity_threshold:
+            # Reduce gtol by 2 orders of magnitude
+            gtol_old = current_config.gtol
+            gtol_new = gtol_old / 100.0
+
+            if gtol_new < min_gtol:
+                # Can't reduce further, accept failure
+                if not suppress_output:
+                    print(f"  gtol limit reached ({gtol_new:.1e} < {min_gtol:.1e}), stopping")
+                return False, results
+
+            if not suppress_output:
+                print(f"  Gradient {results.gradient_norm:.1e} > threshold {infidelity_threshold:.1e}")
+                print(f"  Reducing gtol: {gtol_old:.1e} → {gtol_new:.1e}, retrying...")
+
+            # Create new config with reduced gtol
+            current_config = replace(current_config, gtol=gtol_new)
+            # Continue loop to retry with smaller gtol
+        else:
+            # Gradient is small but still failed - genuine failure
+            # No point retrying with smaller gtol
+            return False, results
+
+    # Max attempts reached (shouldn't happen with reasonable settings)
+    return False, results
 
 
-# ======================================================
-# Any-success at fixed (theta, T) using n_inits
-# ======================================================
+# ============================================================================
+# Multiple initialization attempts at fixed T
+# ============================================================================
 
-def any_success_for_T(
-    *,
-    theta: float,
-    T_ns: float,
+def _try_n_inits(
+    base_config: SimulationConfig,
+    T: float,
+    n_time_steps: int,
     infidelity_threshold: float,
     n_inits: int,
-    pulse_init_scale: float,
-    cfg_kwargs: dict,
-    base_seed: Optional[int],
+    base_seed: Optional[int] = None,
     suppress_output: bool = True,
-) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    for k in range(int(n_inits)):
-        seed_k = None if base_seed is None else int(base_seed) + int(k)
+) -> Tuple[bool, Optional[SQEResults]]:
+    """
+    Try n_inits optimization attempts at a given T.
 
-        attempt = _single_attempt(
-            theta=theta,
-            T_ns=T_ns,
-            infidelity_threshold=infidelity_threshold,
-            attempt_idx=k,
-            seed=seed_k,
-            pulse_init_scale=pulse_init_scale,
-            cfg_kwargs=cfg_kwargs,
-            suppress_output=suppress_output,
+    Success if ANY one of the attempts meets the infidelity threshold.
+
+    Parameters
+    ----------
+    base_config : SimulationConfig
+        Base configuration (will be copied and modified).
+    T : float
+        Total evolution time.
+    n_time_steps : int
+        Number of time steps.
+    infidelity_threshold : float
+        Target infidelity threshold.
+    n_inits : int
+        Number of initialization attempts.
+    base_seed : int, optional
+        Base random seed (will increment for each attempt).
+    suppress_output : bool
+        Whether to suppress optimization output.
+
+    Returns
+    -------
+    success : bool
+        Whether any attempt succeeded.
+    best_results : SQEResults or None
+        Results from successful attempt, or None if all failed.
+    """
+    for k in range(n_inits):
+        # Create config with updated T, n_time_steps, and seed
+        seed_k = None if base_seed is None else base_seed + k
+
+        config = SimulationConfig(
+            zeeman_splittings=base_config.zeeman_splittings,
+            initial_state=base_config.initial_state,
+            theta_target=base_config.theta_target,
+            n_time_steps=n_time_steps,
+            T=T,
+            max_drive_strength=base_config.max_drive_strength,
+            drive_init_scale=base_config.drive_init_scale,
+            drive_seed=seed_k,
+            J_max=base_config.J_max,
+            J_min=base_config.J_min,
+            J_init_scale=base_config.J_init_scale,
+            J_init_seed=seed_k,
+            feromagnetic=base_config.feromagnetic,
         )
-        if attempt["ok"]:
-            return True, attempt
+
+        success, results = _single_optimization_attempt(
+            config, infidelity_threshold, suppress_output
+        )
+
+        if success:
+            return True, results
 
     return False, None
 
 
-# ======================================================
-# MET for ONE theta, ONE run
-# ======================================================
+# ============================================================================
+# MET finding for single (theta, run) combination
+# ============================================================================
 
-def find_MET_for_theta_single_run(
-    *,
-    theta: float,
+def _find_MET_single_run(
+    base_config: SimulationConfig,
     infidelity_threshold: float,
     T_start: float,
     time_schedule: Sequence[Tuple[float, float]],
     n_inits: int,
-    pulse_init_cutoff: float,
-    pulse_init_scale_zero: float,
-    pulse_init_scale_random: float,
-    cfg_kwargs: dict,
+    min_dt: float = 2.0,
     base_seed: Optional[int] = None,
     suppress_output: bool = True,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
-    pulse_init_scale = pulse_init_scale_for_theta(
-        theta,
-        cutoff=pulse_init_cutoff,
-        scale_zero=pulse_init_scale_zero,
-        scale_random=pulse_init_scale_random,
-    )
+    """
+    Find Minimum Excitation Time (MET) for a single run.
 
+    Uses binary-search-like approach with time schedule:
+    - Start at T_start
+    - For each (T_min, step) in schedule:
+      - Decrease T by step while T >= T_min
+      - If success: update MET and continue
+      - If fail: break to next schedule stage
+    - When fail, go back to last successful MET
+
+    Parameters
+    ----------
+    base_config : SimulationConfig
+        Base configuration (theta_target is already set).
+    infidelity_threshold : float
+        Target infidelity threshold.
+    T_start : float
+        Starting evolution time.
+    time_schedule : list of (T_min, step)
+        Optimization schedule. Each tuple specifies (minimum_time, step_size).
+    n_inits : int
+        Number of initialization attempts per T.
+    min_dt : float
+        Minimum time step in ns (default 2.0 ns).
+    base_seed : int, optional
+        Base random seed for this run.
+    suppress_output : bool
+        Whether to suppress optimization prints.
+    verbose : bool
+        Whether to print T → success/fail messages.
+
+    Returns
+    -------
+    dict
+        MET finding results including MET value and success status.
+    """
     last_success_T: Optional[float] = None
-    last_winner: Optional[Dict[str, Any]] = None
+    last_success_results: Optional[SQEResults] = None
     T = float(T_start)
 
     for T_min, step in time_schedule:
@@ -350,158 +295,222 @@ def find_MET_for_theta_single_run(
         step = float(step)
 
         while T >= T_min - 1e-12:
-            ok, winner = any_success_for_T(
-                theta=theta,
-                T_ns=T,
+            # Adjust n_time_steps to ensure dt >= min_dt
+            n_time_steps = int(np.floor(T / min_dt))
+            n_time_steps = max(n_time_steps, 1)  # At least 1 step
+
+            # Try n_inits at this T
+            success, results = _try_n_inits(
+                base_config=base_config,
+                T=T,
+                n_time_steps=n_time_steps,
                 infidelity_threshold=infidelity_threshold,
                 n_inits=n_inits,
                 base_seed=base_seed,
-                pulse_init_scale=pulse_init_scale,
-                cfg_kwargs=cfg_kwargs,
                 suppress_output=suppress_output,
             )
-            if ok:
+
+            if verbose:
+                status = "success" if success else "fail"
+                print(f"T={T:.1f}ns → {status}")
+
+            if success:
                 last_success_T = float(T)
-                last_winner = winner
+                last_success_results = results
                 T -= step
             else:
+                # Failed at this T, break to next schedule stage
                 break
 
+        # If we never succeeded, stop entirely
         if last_success_T is None:
             break
 
+        # Reset T to last successful value for next schedule stage
         T = float(last_success_T)
 
-    return dict(
-        MET=last_success_T,
-        success=(last_success_T is not None),
-        theta=float(theta),
-        infidelity_threshold=float(infidelity_threshold),
-        winner=last_winner,
-        pulse_init_scale=float(pulse_init_scale),
-        n_inits=int(n_inits),
-        base_seed=base_seed,
-    )
+    return {
+        "MET": last_success_T,
+        "success": last_success_T is not None,
+        "theta": float(base_config.theta_target),
+        "infidelity_threshold": float(infidelity_threshold),
+        "best_results": last_success_results,
+    }
 
 
-# ======================================================
-# Scan theta WITHOUT creating progress bars.
-# Caller passes a single global pbar (optional).
-# ======================================================
+# ============================================================================
+# MET scan over theta values
+# ============================================================================
 
 def scan_MET_over_theta(
-    *,
     theta_values: np.ndarray,
-    infidelity_threshold: float,
+    infidelity_thresholds: np.ndarray,
+    base_config: SimulationConfig,
     T_start: float,
     time_schedule: Sequence[Tuple[float, float]],
     n_runs: int,
     n_inits: int,
-    pulse_init_cutoff: float,
-    pulse_init_scale_zero: float,
-    pulse_init_scale_random: float,
-    cfg_kwargs: dict,
+    min_dt: float = 2.0,
+    results_dir: Optional[Path] = None,
     base_seed: Optional[int] = None,
     suppress_output: bool = True,
-    storage: Optional[METStorage] = None,
-    pbar=None,  # external global tqdm
-) -> Dict[str, Any]:
+) -> Dict[float, Dict[str, Any]]:
+    """
+    Scan MET over multiple theta values and infidelity thresholds.
+
+    Parameters
+    ----------
+    theta_values : np.ndarray
+        Array of theta target angles to scan.
+    infidelity_thresholds : np.ndarray
+        Array of infidelity thresholds to test.
+    base_config : SimulationConfig
+        Base configuration (theta_target will be updated for each theta).
+    T_start : float
+        Starting evolution time for MET search.
+    time_schedule : list of (T_min, step)
+        Optimization schedule for binary search.
+    n_runs : int
+        Number of independent runs for each theta (for averaging).
+    n_inits : int
+        Number of initialization attempts per T value.
+    min_dt : float
+        Minimum time step in ns (adjusts n_time_steps automatically).
+    results_dir : Path, optional
+        Directory to save results.
+    base_seed : int, optional
+        Base random seed (will be offset for different runs/thetas/thresholds).
+    suppress_output : bool
+        Whether to suppress single-optimization prints.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping infidelity threshold to MET scan results.
+        Each entry contains: theta_values, MET_runs, MET_mean, MET_std.
+    """
     theta_values = np.asarray(theta_values, dtype=float)
-    n_theta = int(theta_values.size)
+    infidelity_thresholds = np.asarray(infidelity_thresholds, dtype=float)
+    n_theta = len(theta_values)
+    n_thresholds = len(infidelity_thresholds)
     n_runs = int(n_runs)
-    n_inits = int(n_inits)
 
-    MET_runs = np.full((n_theta, n_runs), np.nan, dtype=float)
+    # Total number of runs across all thresholds
+    total_runs = n_theta * n_runs * n_thresholds
+    pbar = tqdm(total=total_runs, desc="MET Scan", unit="run")
 
-    for i, theta in enumerate(theta_values):
-        for r in range(n_runs):
-            run_base_seed = None if base_seed is None else int(base_seed) + 10_000 * int(r) + 100_000 * int(i)
+    print(f"\n{'='*60}")
+    print(f"MET Scan:")
+    print(f"  {n_theta} theta values × {n_runs} runs × {n_thresholds} thresholds")
+    print(f"  = {total_runs} total optimizations")
+    print(f"Infidelity thresholds: {infidelity_thresholds}")
+    print(f"{'='*60}\n")
 
-            out = find_MET_for_theta_single_run(
-                theta=float(theta),
-                infidelity_threshold=float(infidelity_threshold),
-                T_start=float(T_start),
-                time_schedule=time_schedule,
-                n_inits=n_inits,
-                pulse_init_cutoff=float(pulse_init_cutoff),
-                pulse_init_scale_zero=float(pulse_init_scale_zero),
-                pulse_init_scale_random=float(pulse_init_scale_random),
-                cfg_kwargs=cfg_kwargs,
-                base_seed=run_base_seed,
-                suppress_output=suppress_output,
+    # Dictionary to store results for each threshold
+    all_results = {}
+
+    for threshold_idx, infidelity_threshold in enumerate(infidelity_thresholds):
+        print(f"\n{'='*60}")
+        print(f"Threshold {threshold_idx+1}/{n_thresholds}: I = {infidelity_threshold:.1e}")
+        print(f"{'='*60}\n")
+
+        # Initialize results arrays for this threshold
+        MET_runs = np.full((n_theta, n_runs), np.nan, dtype=float)
+
+        for i, theta in enumerate(theta_values):
+            for r in range(n_runs):
+                # Generate unique seed for this (threshold, theta, run) combination
+                run_seed = None if base_seed is None else (
+                    base_seed + 10_000 * r + 100_000 * i + 1_000_000 * threshold_idx
+                )
+
+                # Create config with current theta
+                config = SimulationConfig(
+                    zeeman_splittings=base_config.zeeman_splittings,
+                    initial_state=base_config.initial_state,
+                    theta_target=theta,
+                    n_time_steps=base_config.n_time_steps,  # Will be adjusted in MET search
+                    T=base_config.T,  # Will be adjusted in MET search
+                    max_drive_strength=base_config.max_drive_strength,
+                    drive_init_scale=base_config.drive_init_scale,
+                    drive_seed=run_seed,
+                    J_max=base_config.J_max,
+                    J_min=base_config.J_min,
+                    J_init_scale=base_config.J_init_scale,
+                    J_init_seed=run_seed,
+                    feromagnetic=base_config.feromagnetic,
+                )
+
+                print(f"\n--- I={infidelity_threshold:.1e}, Theta {i+1}/{n_theta} (θ={theta/np.pi:.3f}π), Run {r+1}/{n_runs} ---")
+
+                # Find MET for this (theta, run)
+                met_result = _find_MET_single_run(
+                    base_config=config,
+                    infidelity_threshold=infidelity_threshold,
+                    T_start=T_start,
+                    time_schedule=time_schedule,
+                    n_inits=n_inits,
+                    min_dt=min_dt,
+                    base_seed=run_seed,
+                    suppress_output=suppress_output,
+                    verbose=True,
+                )
+
+                met_value = met_result["MET"]
+                MET_runs[i, r] = np.nan if met_value is None else float(met_value)
+
+                # Print conclusion
+                if met_value is not None:
+                    print(f"✓ MET found: {met_value:.1f} ns")
+                else:
+                    print(f"✗ MET not found (failed at all T values)")
+
+                # Update progress bar
+                pbar.update(1)
+                met_str = f"{met_value:.1f}" if met_value is not None else "nan"
+                pbar.set_postfix_str(
+                    f"I={infidelity_threshold:.1e}, θ={theta/np.pi:.3f}π, MET={met_str}ns"
+                )
+
+        # Compute statistics for this threshold
+        MET_mean = np.nanmean(MET_runs, axis=1)
+        MET_std = np.nanstd(MET_runs, axis=1)
+
+        # Save results for this threshold
+        all_results[float(infidelity_threshold)] = {
+            "theta_values": theta_values,
+            "MET_runs": MET_runs,
+            "MET_mean": MET_mean,
+            "MET_std": MET_std,
+            "infidelity_threshold": float(infidelity_threshold),
+        }
+
+        # Save to file if directory provided
+        if results_dir is not None:
+            results_dir = Path(results_dir).expanduser().resolve()
+            results_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create subdirectory for this infidelity threshold
+            threshold_name = f"I_{infidelity_threshold:.0e}".replace("+", "")
+            threshold_dir = results_dir / threshold_name
+            threshold_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save MET table
+            np.savez_compressed(
+                threshold_dir / "met_table.npz",
+                theta_values=theta_values,
+                MET_runs=MET_runs,
+                MET_mean=MET_mean,
+                MET_std=MET_std,
+                infidelity_threshold=infidelity_threshold,
             )
 
-            met = out["MET"]
-            MET_runs[i, r] = np.nan if met is None else float(met)
+            print(f"\n✓ Results saved to: {threshold_dir / 'met_table.npz'}")
 
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix_str(
-                    f"I={infidelity_threshold:.0e}  "
-                    f"theta={theta/np.pi:.3f}π  "
-                    f"run={r+1}/{n_runs}  "
-                    f"MET={('nan' if met is None else f'{met:.1f}ns')}"
-                )
+    pbar.close()
 
-            if storage is not None:
-                summary = {
-                    "theta": float(theta),
-                    "theta_idx": int(i),
-                    "run_idx": int(r),
-                    "infidelity_threshold": float(infidelity_threshold),
-                    "MET": None if met is None else float(met),
-                    "success": bool(out["success"]),
-                    "n_inits": int(n_inits),
-                    "n_runs": int(n_runs),
-                    "pulse_init_scale": float(out["pulse_init_scale"]),
-                    "run_base_seed": run_base_seed,
-                }
+    print(f"\n{'='*60}")
+    print("MET Scan Complete!")
+    print(f"{'='*60}\n")
 
-                arrays_to_save: Dict[str, np.ndarray] = {}
-                cfg_to_save = None
-
-                winner = out.get("winner", None)
-                if winner is not None:
-                    cfg_to_save = winner.get("cfg", None)
-                    results = winner.get("results", None)
-
-                    summary["winner_attempt_idx"] = int(winner.get("attempt_idx", -1))
-                    summary["winner_I_final"] = float(winner.get("I_final", np.nan))
-                    summary["winner_seed"] = winner.get("seed", None)
-
-                    if results is not None:
-                        payload = _results_to_save_payload(results)
-                        arrays = payload.pop("_arrays", {})
-                        for k, v in arrays.items():
-                            arrays_to_save[k] = v
-                        summary["saved_arrays"] = payload.get("_arrays_present", [])
-
-                storage.write_run_result(
-                    infidelity_threshold=float(infidelity_threshold),
-                    theta_idx=int(i),
-                    theta=float(theta),
-                    run_idx=int(r),
-                    summary=summary,
-                    cfg=cfg_to_save,
-                    arrays=arrays_to_save if len(arrays_to_save) > 0 else None,
-                )
-
-    MET_mean = np.nanmean(MET_runs, axis=1)
-    MET_std = np.nanstd(MET_runs, axis=1)
-
-    if storage is not None:
-        storage.write_threshold_table(
-            infidelity_threshold=float(infidelity_threshold),
-            theta_values=theta_values,
-            MET_runs=MET_runs,
-            MET_mean=MET_mean,
-            MET_std=MET_std,
-        )
-
-    return dict(
-        theta_values=theta_values,
-        MET_runs=MET_runs,
-        MET_mean=MET_mean,
-        MET_std=MET_std,
-        infidelity_threshold=float(infidelity_threshold),
-    )
+    return all_results

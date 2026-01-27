@@ -4,7 +4,7 @@ import numpy as np
 from scipy.optimize import minimize
 from typing import List, Optional, Tuple
 
-from .dataclasses import SimulationConfig, SQEResults
+from .dataclasses_old import SimulationConfig, SQEResults
 from .device import (
     build_device,
     build_hilbert_space,

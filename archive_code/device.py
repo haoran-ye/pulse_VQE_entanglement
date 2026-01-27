@@ -6,7 +6,7 @@ import tensorflow as tf
 from qugrad import QuantumSystem
 from qugradlab.hilbert_spaces import QubitSpace
 
-from .dataclasses import *
+from .dataclasses_old import *
 
 
 # Units: inputs (ns, MHz), internals (rad/s, s), cost (infidelity = 1 - fidelity)
