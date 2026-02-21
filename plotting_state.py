@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 from .dataclasses import SQEResults
-from .sqe_optimisation import single_qubit_excitation, get_Sent_single, get_Sent_traj
+from .sqe_state import single_qubit_excitation, get_Sent_single, get_Sent_traj
 from .dqe_optimisation import entropy_bipartite_traj, dqe_unitary, entropy_bipartite_single
 
 
@@ -75,10 +75,11 @@ def plot_control_pulses(results: SQEResults, ax=None):
     xf_plot = np.concatenate([results.x_final, [results.x_final[-1]]])
     Jf_plot = _rescale_J(xf_plot, J_min, J_max)
 
-    if results.baseline is None:
+    run_mode = config.run_mode
+    if run_mode == "infidelity":
         label = 'I-optimised'
         color = COLOR_FIDELITY_ONLY
-    else:
+    else:  # "entropy" or "both"
         label = 'S-optimised'
         color = COLOR_ENTANGLEMENT
 
@@ -122,10 +123,11 @@ def plot_infidelity_evolution(results: SQEResults, ax=None):
             zorder=3,
         )
 
-    if results.baseline is None:
+    run_mode = config.run_mode
+    if run_mode == "infidelity":
         label = 'I-optimised'
         color = COLOR_FIDELITY_ONLY
-    else:
+    else:  # "entropy" or "both"
         label = 'S-optimised'
         color = COLOR_ENTANGLEMENT
 
@@ -175,10 +177,11 @@ def plot_entanglement_evolution(results: SQEResults, ax=None):
 
     Sent_final = get_Sent_traj(results.final_traj)
 
-    if results.baseline is None:
+    run_mode = config.run_mode
+    if run_mode == "infidelity":
         label = 'I-optimised'
         color = COLOR_FIDELITY_ONLY
-    else:
+    else:  # "entropy" or "both"
         label = 'S-optimised'
         color = COLOR_ENTANGLEMENT
 
@@ -236,21 +239,29 @@ def plot_control_pulses_multiJ(results: SQEResults, ax=None):
         ax.step(t, y0, where="post", color=COLOR_INITIAL, alpha=0.35 if nJ > 1 else 1.0,
                 label="Initial Pulse" if j == 0 else None)
 
-    # plot baseline if exists
+    # plot baseline if exists (only in "both" mode)
     if results.baseline is not None:
         xb = np.asarray(results.baseline.x_final, float).reshape(nT, nJ)
         for j in range(nJ):
             yb = np.concatenate([xb[:, j], [xb[-1, j]]])
             ax.step(t, yb, where="post", color=COLOR_FIDELITY_ONLY, linestyle="--",
                     alpha=0.8 if nJ > 1 else 1.0,
-                    label="Optimised (fidelity only)" if j == 0 else None)
+                    label="I-optimised" if j == 0 else None)
 
-    # plot entanglement-aware
+    # plot final optimised result
+    run_mode = cfg.run_mode
+    if run_mode == "infidelity":
+        final_label = "I-optimised"
+        final_color = COLOR_FIDELITY_ONLY
+    else:  # "entropy" or "both"
+        final_label = "S-optimised"
+        final_color = COLOR_ENTANGLEMENT
+
     for j in range(nJ):
         yf = np.concatenate([xf[:, j], [xf[-1, j]]])
-        ax.step(t, yf, where="post", color= COLOR_ENTANGLEMENT,
+        ax.step(t, yf, where="post", color=final_color,
                 alpha=0.8 if nJ > 1 else 1.0,
-                label="Optimised (entanglement-aware)" if j == 0 else None)
+                label=final_label if j == 0 else None)
 
     ax.set_xlabel("Time (ns)")
     ax.set_ylabel("J (arb.)")
@@ -277,13 +288,21 @@ def plot_entanglement_evolution_dqe(results: SQEResults, ax=None):
     S0 = entropy_bipartite_traj(results.initial_traj, subsystem=subsystem, n_qubits=4)
     Sf = entropy_bipartite_traj(results.final_traj, subsystem=subsystem, n_qubits=4)
 
-    ax.plot(t, S0, label="Initial S", color=COLOR_INITIAL)
+    ax.plot(t, S0, label="Initial", color=COLOR_INITIAL)
 
     if results.baseline is not None:
         Sb = entropy_bipartite_traj(results.baseline.final_traj, subsystem=subsystem, n_qubits=4)
-        ax.plot(t, Sb, label="Final S (fidelity only)", color=COLOR_FIDELITY_ONLY, linestyle="--")
+        ax.plot(t, Sb, label="I-optimised", color=COLOR_FIDELITY_ONLY, linestyle="--")
 
-    ax.plot(t, Sf, label="Final S (entanglement-aware)", color=COLOR_ENTANGLEMENT)
+    run_mode = cfg.run_mode
+    if run_mode == "infidelity":
+        final_label = "I-optimised"
+        final_color = COLOR_FIDELITY_ONLY
+    else:  # "entropy" or "both"
+        final_label = "S-optimised"
+        final_color = COLOR_ENTANGLEMENT
+
+    ax.plot(t, Sf, label=final_label, color=final_color)
 
     # target entropy
     target_state = dqe_unitary(cfg.theta_target) @ cfg.initial_state
@@ -309,7 +328,7 @@ def plot_dqe_optimisation(results: SQEResults, figsize=(12, 8)):
     # infidelity evolution (reuse your existing function if you want,
     # or keep a copy with the baseline curve — simplest is to reuse yours if it checks baseline)
     # Here I assume your plot_infidelity_evolution already supports baseline.
-    from .plotting import plot_infidelity_evolution  # if you keep it in same file remove this import
+    from .plotting_state import plot_infidelity_evolution  # if you keep it in same file remove this import
     plot_infidelity_evolution(results, ax=axes[1])
 
     # DQE entropy plot

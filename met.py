@@ -17,7 +17,7 @@ import numpy as np
 from tqdm import tqdm
 
 from .dataclasses import SimulationConfig, SQEResults
-from .sqe_optimisation import sqe_optimisation
+from .sqe_state import sqe_optimisation
 
 
 # ============================================================================

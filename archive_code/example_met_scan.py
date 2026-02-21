@@ -10,7 +10,7 @@ from pathlib import Path
 
 from dataclasses import SimulationConfig
 from met import scan_MET_over_theta
-from plotting import plot_MET_vs_theta, plot_MET_vs_theta_from_dir
+from pulse_vqe_entanglement.plotting_state import plot_MET_vs_theta, plot_MET_vs_theta_from_dir
 
 # ============================================================================
 # Configuration
