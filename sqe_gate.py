@@ -1,141 +1,84 @@
 """
-Changes from previous version:
-1. Uses local QuGrad-Private and QuGradLab-Private packages instead of
-   pip-installed qugradlab/qugrad.
-2. Uses the built-in gate_gradient() method from QuantumSystem for computing
-   gate infidelity gradients, instead of the manual PySTE switching-function
-   approach (_gate_infidelity_and_grad_pyste).
+Gate-based SQE optimization for 2-spin systems.
 
-   gate_gradient() uses TF GradientTape + GateInfidelityCustom (which wraps
-   PySTE's gate_switching_function under the hood) to automatically
-   differentiate through the entire pulse-function chain (coarse->fine,
-   rescaling, envelope processing), eliminating the need for manual chain-rule
-   computation.
+Optimizes piecewise-constant exchange coupling pulses to implement a target
+2-qubit gate, with optional operator-entanglement constraints via an augmented
+Lagrangian primal-dual method.
+
+Run modes (config.run_mode)
+---------------------------
+"infidelity" : Minimize gate infidelity only (uses QuGrad autodiff gradient).
+"entropy"    : Minimize operator entanglement subject to infidelity ≤ ε,
+               using finite-difference gradients for the entanglement cost.
+"both"       : Run "infidelity" first, then "entropy" from the same x0;
+               returns the constrained result with the baseline attached.
+
+Entanglement measure
+--------------------
+Set config.gate_ent_measure to any key in entanglement_measures.GATE_MEASURES.
+Currently supported: "operator_entanglement" (default), "average_entangling_power",
+"max_output_entanglement", "assisted_entangling_power".
+
+Extra measures for plotting
+---------------------------
+Set config.extra_ent_measures to a list of additional gate measure names. Their
+trajectories are pre-computed in _package_gate_results and stored in
+SQEGateResults.extra_ent_initial / extra_ent_final.
+
+Performance note
+----------------
+The 4 basis-state driven systems (used to reconstruct the full unitary) are
+built once before the optimisation loop so that the TF computation graphs are
+compiled only once, not on every function evaluation.
 """
 from __future__ import annotations
 
-from .dataclasses import *
-
-import sys
 import os
+import sys
+import numpy as np
+import tensorflow as tf
+from concurrent.futures import ThreadPoolExecutor
+from scipy.optimize import minimize
+from scipy.linalg import expm
 
+from .dataclasses import SimulationConfig, SQEGateResults
+from .entanglement_measures import (
+    GATE_MEASURES,
+    operator_entanglement,
+)
+
+# ---- Use local private QuGrad & QuGradLab for unpublished features ----
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_DIR = os.path.dirname(_THIS_DIR)
-
-# Use local QuGrad-Private and QuGradLab-Private packages instead of
-# pip-installed versions. These must be added BEFORE any qugradlab/qugrad
-# imports so the local versions shadow any installed ones.
 sys.path.insert(0, os.path.join(_PROJECT_DIR, "QuGrad-Private", "src"))
 sys.path.insert(0, os.path.join(_PROJECT_DIR, "QuGradLab-Private", "src"))
 
-import numpy as np
-import tensorflow as tf
-from scipy.optimize import minimize
-
 from qugradlab.systems.semiconducting.esr import SpinChain
 
-# ========== Helpers (from sqe_optimisation.py) ==========
+NS_TO_US = 1e-3
+
+
+# =============================================================================
+# System construction
+# =============================================================================
 
 def convert_dtype(np_array) -> tf.Tensor:
-    """Convert numpy array to TensorFlow complex128 tensor."""
     return tf.cast(tf.convert_to_tensor(np_array), dtype=tf.complex128)
 
 
 def single_qubit_excitation(theta: float) -> np.ndarray:
-    """SQE gate: rotation in |01>↔|10> subspace by angle theta."""
+    """
+    Single-qubit rotation in the two-spin subspace.
+
+    Rotates the |01⟩ ↔ |10⟩ subspace by angle theta while leaving |00⟩ and
+    |11⟩ unchanged. Basis order: [|00⟩, |01⟩, |10⟩, |11⟩].
+    """
+    c, s = np.cos(theta), np.sin(theta)
     return np.array(
-        [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, np.cos(theta), -np.sin(theta), 0.0],
-            [0.0, np.sin(theta),  np.cos(theta), 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
+        [[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]],
         dtype=np.complex128,
     )
 
-
-def get_Sent_traj(traj: np.ndarray) -> np.ndarray:
-    """Entanglement entropy along a 2-qubit state trajectory."""
-    traj = np.asarray(traj)
-    psi = traj.T.reshape(-1, 2, 2)
-    rho_A = psi @ np.conj(psi).transpose(0, 2, 1)
-    eig = np.linalg.eigvalsh(rho_A)
-    eig = np.clip(eig, 1e-15, 1.0)
-    return -np.sum(eig * np.log2(eig), axis=1)
-
-
-def _initialise_seed(config: SimulationConfig) -> None:
-    """Initialize random seed from config."""
-    if config.init_seed is not None:
-        np.random.seed(int(config.init_seed))
-        return
-    if config.drive_seed is not None or config.J_init_seed is not None:
-        seed = config.drive_seed if config.drive_seed is not None else config.J_init_seed
-        np.random.seed(int(seed))
-
-
-def _initialise_x0(config: SimulationConfig) -> np.ndarray:
-    """Initialize control parameters in [-1, 1], assuming no drive controls."""
-    n_params = config.n_time_steps * config.n_J_channels
-    x0 = config.J_init_scale * np.random.uniform(-1.0, 1.0, size=n_params)
-    return np.clip(x0, -1.0, 1.0)
-
-
-def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
-    """Create the mapping from x to pulse parameters and make the driven system."""
-    n_steps = config.n_time_steps
-    n_disc = config.n_discretisation
-    T = config.T
-
-    def pulse_function(x):
-        x_tf = convert_dtype(x)
-        x_coarse = tf.reshape(x_tf, (n_steps, config.n_J_channels))
-        x_fine = tf.repeat(x_coarse, repeats=n_disc, axis=0)
-        n_fine = n_steps * n_disc
-        dt_fine_us = (T / n_fine) * NS_TO_US
-        drive_ctrl_amp = convert_dtype(np.zeros((n_fine, 2)))
-        J_ctrl_amp = x_fine
-        init = convert_dtype(config.initial_state)
-        freqs = convert_dtype(config.zeeman_splittings)
-        return drive_ctrl_amp, freqs, J_ctrl_amp, init, dt_fine_us
-
-    return sys.pulse_form(pulse_function)
-
-
-# ========== Gate Infidelity & Entangling Power Utilities ==========
-
-def gate_infidelity(U: np.ndarray, target: np.ndarray) -> float:
-    """Average gate infidelity: 1 - (|Tr(target^dag U)|^2 + d) / (d(d+1))"""
-    d = U.shape[0]
-    overlap = np.trace(target.conj().T @ U)
-    return float(1.0 - (np.abs(overlap) ** 2 + d) / (d * (d + 1)))
-
-
-def get_gate_infidelity_traj(U_traj: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """Gate infidelity at each timestep. U_traj: (n_time_steps, dim, dim)."""
-    return np.array([gate_infidelity(U_traj[t], target) for t in range(U_traj.shape[0])])
-
-
-def operator_entanglement(U: np.ndarray) -> float:
-    """Operator entanglement of a 2-qubit unitary (bits), via Choi matrix SVD."""
-    d = U.shape[0]
-    d_A, d_B = 2, 2
-    Phi = U / np.sqrt(d)
-    Phi_4d = Phi.reshape(d_A, d_B, d_A, d_B)
-    Phi_perm = Phi_4d.transpose(0, 2, 1, 3)
-    Phi_mat = Phi_perm.reshape(d_A**2, d_B**2)
-    s = np.linalg.svd(Phi_mat, compute_uv=False)
-    p = s**2
-    p = p[p > 1e-15]
-    return float(-np.sum(p * np.log2(p)))
-
-
-def get_operator_entanglement_traj(U_traj: np.ndarray) -> np.ndarray:
-    """Operator entanglement at each timestep."""
-    return np.array([operator_entanglement(U_traj[t]) for t in range(U_traj.shape[0])])
-
-
-# ========== Internal Helpers ==========
 
 def _make_system(config: SimulationConfig) -> SpinChain:
     return SpinChain(
@@ -149,52 +92,144 @@ def _make_system(config: SimulationConfig) -> SpinChain:
     )
 
 
-def _get_unitary_traj(config: SimulationConfig, sys: SpinChain, x: np.ndarray) -> np.ndarray:
+def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
     """
-    Returns U_traj (n_fine+1, dim, dim) by propagating each basis vector.
-    """
-    x = np.asarray(x, dtype=np.float64)
-    dim = 4
-    n_fine = int(config.n_time_steps) * int(config.n_discretisation)
-    U_traj = np.zeros((n_fine + 1, dim, dim), dtype=np.complex128)
+    Create a driven system with piecewise-constant pulse interpolation.
 
+    Optimization parameters live on a coarse grid (n_time_steps); state
+    evolution uses a finer grid (n_time_steps × n_discretisation) via
+    piecewise-constant interpolation.
+    """
+    n_steps = int(config.n_time_steps)
+    n_disc = int(config.n_discretisation)
+    n_fine = n_steps * n_disc
+    dt_fine_us = (float(config.T) / n_fine) * NS_TO_US
+
+    def pulse_function(x):
+        x_coarse = tf.reshape(tf.convert_to_tensor(x, dtype=tf.float64),
+                              (n_steps, int(config.n_J_channels)))
+        x_fine = tf.cast(tf.repeat(x_coarse, repeats=n_disc, axis=0), tf.complex128)
+        return (
+            convert_dtype(np.zeros((n_fine, 2))),   # drive amplitudes (disabled)
+            tf.zeros(2),                            # drive frequencies
+            x_fine,                                 # J coupling amplitudes
+            convert_dtype(config.initial_state),    # initial state
+            dt_fine_us * 2 * np.pi,                 # timestep (rad/μs)
+        )
+
+    return sys.pulse_form(pulse_function)
+
+
+def _build_basis_driven_systems(config: SimulationConfig, sys: SpinChain) -> list:
+    """
+    Build one driven system per computational basis state.
+
+    Constructed once before optimisation so TF graph compilation happens only
+    once, not on every function evaluation. Each system propagates a single
+    basis vector, allowing reconstruction of the full unitary trajectory.
+    """
+    dim = 4
+    systems = []
     for i in range(dim):
         basis = np.zeros(dim, dtype=np.complex128)
         basis[i] = 1.0
         cfg_i = SimulationConfig(**vars(config))
         cfg_i.initial_state = basis
-        driven_sys_i = _make_driven_sys(cfg_i, sys)
-        psi_traj = np.asarray(driven_sys_i.propagate_all(x)).T
-        U_traj[:, :, i] = psi_traj
+        systems.append(_make_driven_sys(cfg_i, sys))
+    return systems
+
+
+# =============================================================================
+# Unitary and observable trajectories
+# =============================================================================
+
+def _get_unitary_traj(config: SimulationConfig, sys: SpinChain, x: np.ndarray,
+                      basis_driven_systems: list | None = None) -> np.ndarray:
+    """
+    Propagate each basis state and assemble the full unitary trajectory.
+
+    Returns
+    -------
+    U_traj : ndarray, shape (n_fine + 1, 4, 4)
+        Unitary at each fine time step, with U_traj[t, :, i] = U(t)|i⟩.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n_fine = int(config.n_time_steps) * int(config.n_discretisation)
+    U_traj = np.zeros((n_fine + 1, 4, 4), dtype=np.complex128)
+
+    if basis_driven_systems is None:
+        basis_driven_systems = _build_basis_driven_systems(config, sys)
+
+    for i, ds in enumerate(basis_driven_systems):
+        U_traj[:, :, i] = np.asarray(ds.propagate_all(x)).T
 
     return U_traj
 
 
-def _package_gate_results(
-    *,
-    config,
-    sys,
-    target_gate,
-    x0,
-    xf,
-    success,
-    nit,
-    grad_norm,
-    lam_final=None,
-    history=None,
-    baseline=None,
-):
-    U_traj_0 = _get_unitary_traj(config, sys, x0)
-    U_traj_f = _get_unitary_traj(config, sys, xf)
+def gate_infidelity(U: np.ndarray, target: np.ndarray) -> float:
+    """Gate infidelity: 1 - (|Tr(U†T)|² + d) / (d(d+1))."""
+    d = U.shape[0]
+    return float(1.0 - (np.abs(np.trace(target.conj().T @ U)) ** 2 + d) / (d * (d + 1)))
+
+
+def get_gate_infidelity_traj(U_traj: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Gate infidelity at each time step along U_traj."""
+    return np.array([gate_infidelity(U_traj[t], target) for t in range(U_traj.shape[0])])
+
+
+def get_gate_entanglement_traj(U_traj: np.ndarray,
+                               measure_fn=operator_entanglement) -> np.ndarray:
+    """
+    Gate entanglement measure at each time step along U_traj.
+
+    Parameters
+    ----------
+    measure_fn : callable
+        A gate measure from GATE_MEASURES. Defaults to operator_entanglement.
+    """
+    return np.array([measure_fn(U_traj[t]) for t in range(U_traj.shape[0])])
+
+
+def _initialise_seed(config: SimulationConfig) -> None:
+    if config.J_init_seed is not None:
+        np.random.seed(int(config.J_init_seed))
+
+
+def _initialise_x0(config: SimulationConfig) -> np.ndarray:
+    """Initial control parameters drawn uniformly in [-1, 1]."""
+    n = int(config.n_time_steps) * int(config.n_J_channels)
+    x0 = config.J_init_mean + float(config.J_init_scale) * np.random.uniform(-1.0, 1.0, size=n)
+    return np.clip(x0, -1.0, 1.0).astype(np.float64, copy=False)
+
+
+def _package_gate_results(*, config, sys, target_gate, x0, xf, success, nit, grad_norm,
+                          lam_final=None, history=None, baseline=None) -> SQEGateResults:
+    """
+    Compute unitary trajectories for x0 and xf and pack into SQEGateResults.
+
+    Evaluates config.gate_ent_measure as the main entanglement trajectory and
+    each name in config.extra_ent_measures as additional stored trajectories.
+    """
+    U0 = _get_unitary_traj(config, sys, x0)
+    Uf = _get_unitary_traj(config, sys, xf)
+
+    ent_fn = GATE_MEASURES[config.gate_ent_measure]
+
+    extra_initial = {name: get_gate_entanglement_traj(U0, GATE_MEASURES[name])
+                     for name in config.extra_ent_measures}
+    extra_final   = {name: get_gate_entanglement_traj(Uf, GATE_MEASURES[name])
+                     for name in config.extra_ent_measures}
 
     return SQEGateResults(
         config=config,
         x0=np.asarray(x0, float),
         x_final=np.asarray(xf, float),
-        infid_initial=get_gate_infidelity_traj(U_traj_0, target_gate),
-        infid_final=get_gate_infidelity_traj(U_traj_f, target_gate),
-        ent_initial=get_operator_entanglement_traj(U_traj_0),
-        ent_final=get_operator_entanglement_traj(U_traj_f),
+        infid_initial=get_gate_infidelity_traj(U0, target_gate),
+        infid_final=get_gate_infidelity_traj(Uf, target_gate),
+        ent_initial=get_gate_entanglement_traj(U0, ent_fn),
+        ent_final=get_gate_entanglement_traj(Uf, ent_fn),
+        extra_ent_initial=extra_initial,
+        extra_ent_final=extra_final,
         gradient_norm=float(grad_norm),
         n_iterations=int(nit),
         optimization_success=bool(success),
@@ -204,232 +239,228 @@ def _package_gate_results(
     )
 
 
-def _convert_state_results(sqe_results):
-    config = sqe_results.config
-    ent_initial = get_Sent_traj(sqe_results.initial_traj)
-    ent_final = get_Sent_traj(sqe_results.final_traj)
+# =============================================================================
+# Entropy-constrained (primal-dual) optimisation
+# =============================================================================
 
-    baseline = None
-    if sqe_results.baseline is not None:
-        baseline = _convert_state_results(sqe_results.baseline)
+def _cost_entangling_power(basis_driven_systems: list, config: SimulationConfig,
+                           x: np.ndarray, *, ep_max: float) -> float:
+    """
+    Mean squared trajectory violation of the entanglement cap.
 
-    return SQEGateResults(
-        config=config,
-        x0=sqe_results.x0,
-        x_final=sqe_results.x_final,
-        infid_initial=sqe_results.val0,
-        infid_final=sqe_results.val_final,
-        ent_initial=ent_initial,
-        ent_final=ent_final,
-        gradient_norm=sqe_results.gradient_norm,
-        n_iterations=sqe_results.n_iterations,
-        optimization_success=sqe_results.optimization_success,
-        lam_final=sqe_results.lam_final,
-        history=sqe_results.history,
-        baseline=baseline,
-    )
-
-
-# ========== Entangling-Power-Constrained Optimization ==========
-
-def _cost_entangling_power(config, sys, x, *, ep_max: float) -> float:
-    U_traj = _get_unitary_traj(config, sys, x)
-    ep = get_operator_entanglement_traj(U_traj)
-    viol = np.maximum(0.0, ep - ep_max)
+    cost = mean((E(t) - E_max)₊²), where E is config.gate_ent_measure.
+    """
+    ent_fn = GATE_MEASURES[config.gate_ent_measure]
+    U_traj = _get_unitary_traj(config, None, x, basis_driven_systems=basis_driven_systems)
+    viol = np.maximum(0.0, get_gate_entanglement_traj(U_traj, ent_fn) - ep_max)
     return float(np.mean(viol**2))
 
 
-def _ep_grad_fd(config, sys, x, *, ep_max: float, eps: float) -> np.ndarray:
+def _ep_grad_fd(basis_driven_systems: list, config: SimulationConfig, x: np.ndarray, *,
+                ep_max: float, eps: float, f0: float | None = None) -> np.ndarray:
+    """
+    Forward-difference gradient of the entanglement cost, parallelised over parameters.
+
+    Parameters
+    ----------
+    f0 : float, optional
+        Cost at the unperturbed x. Providing it avoids a redundant evaluation.
+    """
     x = np.asarray(x, float)
-    g = np.zeros_like(x)
-    f0 = _cost_entangling_power(config, sys, x, ep_max=ep_max)
-    for i in range(len(x)):
+    if f0 is None:
+        f0 = _cost_entangling_power(basis_driven_systems, config, x, ep_max=ep_max)
+
+    def _fi(i: int) -> float:
         xp = x.copy()
         xp[i] += eps
-        g[i] = (_cost_entangling_power(config, sys, xp, ep_max=ep_max) - f0) / eps
-    return g
+        return (_cost_entangling_power(basis_driven_systems, config, xp, ep_max=ep_max) - f0) / eps
+
+    with ThreadPoolExecutor(max_workers=min(len(x), os.cpu_count() or 1)) as pool:
+        return np.array(list(pool.map(_fi, range(len(x)))), dtype=float)
 
 
 def _lagrangian_and_grad(
-    driven_sys, config, sys, x, *, target_gate, lam, ep_max, fd_eps, rho, eps_infidelity
-):
-    EP = _cost_entangling_power(config, sys, x, ep_max=ep_max)
-    gEP = _ep_grad_fd(config, sys, x, ep_max=ep_max, eps=fd_eps)
+    driven_sys, basis_driven_systems: list, config: SimulationConfig, x: np.ndarray, *,
+    target_gate: np.ndarray, lam: float, ep_max: float, fd_eps: float, rho: float,
+    eps_infidelity: float,
+) -> tuple[float, np.ndarray]:
+    """
+    Augmented Lagrangian value and gradient.
 
-    gi, grad_gi = driven_sys.gate_gradient(x, target_gate)
-    constraint = gi - eps_infidelity
+    Objective: L = EP_cost + λ(GI - ε) + (ρ/2)(GI - ε)²
 
-    L = EP + lam * constraint
-    grad_L = gEP + lam * grad_gi
+    where EP_cost is the mean-squared entanglement violation (using
+    config.gate_ent_measure) and GI is the gate infidelity (GI ≤ ε via λ).
+    """
+    EP = _cost_entangling_power(basis_driven_systems, config, x, ep_max=ep_max)
+    gEP = _ep_grad_fd(basis_driven_systems, config, x, ep_max=ep_max, eps=fd_eps, f0=EP)
 
-    if rho != 0.0:
-        L += 0.5 * rho * (constraint**2)
-        grad_L += rho * constraint * grad_gi
+    gi, ggi = driven_sys.gate_gradient(x, target_gate)
+    gi, ggi = float(gi), np.asarray(ggi, float)
+    c = gi - float(eps_infidelity)
 
-    return float(L), np.asarray(grad_L, float)
+    L = EP + lam * c + 0.5 * float(rho) * c**2
+    gL = gEP + (lam + float(rho) * c) * ggi
+    return float(L), gL
 
 
-def _primal_dual_optimise(driven_sys, config, sys, x0, *, target_gate, bounds, verbose=True):
+def _primal_dual_optimise(
+    driven_sys, basis_driven_systems: list, config: SimulationConfig, x0: np.ndarray, *,
+    target_gate: np.ndarray, bounds, verbose: bool = True,
+) -> tuple[np.ndarray, float, list[dict]]:
+    """
+    Augmented Lagrangian primal-dual loop.
+
+    Each outer iteration minimises the Lagrangian via L-BFGS-B, then updates
+    the dual variable λ ← max(0, λ + α(GI - ε)).
+
+    Returns
+    -------
+    x_final : np.ndarray
+    lam_final : float
+    history : list[dict]  – per-outer-iteration diagnostics
+    """
     x = np.asarray(x0, float).copy()
-    lam = 1e0
-    hist = []
-
+    lam = 1.0
     ep_max = float(config.S_max)
+    hist: list[dict] = []
 
     for k in range(int(config.n_outer)):
-
-        def fun_and_jac(z):
-            return _lagrangian_and_grad(
-                driven_sys, config, sys, z,
-                target_gate=target_gate,
-                lam=lam,
-                ep_max=ep_max,
-                fd_eps=float(config.fd_eps),
-                rho=float(config.rho),
-                eps_infidelity=float(config.eps_infidelity),
-            )
-
         res = minimize(
-            fun_and_jac,
-            x0=x,
-            jac=True,
-            method="L-BFGS-B",
-            bounds=bounds,
+            lambda z: _lagrangian_and_grad(
+                driven_sys, basis_driven_systems, config, z,
+                target_gate=target_gate, lam=lam, ep_max=ep_max,
+                fd_eps=float(config.fd_eps), rho=float(config.rho),
+                eps_infidelity=float(config.eps_infidelity),
+            ),
+            x0=x, jac=True, method="L-BFGS-B", bounds=bounds,
             options={"maxiter": int(config.inner_maxiter), "gtol": float(config.gtol)},
         )
         x = np.asarray(res.x, float)
 
-        # Use built-in gate_gradient
-        gi, _ = driven_sys.gate_gradient(x, target_gate)
-        gi = float(gi)
-        constraint = gi - float(config.eps_infidelity)
-        lam = max(0.0, lam + float(config.dual_lr) * constraint)
+        gi = float(driven_sys.gate_gradient(x, target_gate)[0])
+        c = gi - float(config.eps_infidelity)
+        lam = max(0.0, lam + float(config.dual_lr) * c)
 
-        hist.append(
-            {
-                "outer_iter": k,
-                "lam": lam,
-                "GI_final": gi,
-                "constraint_residual": constraint,
-                "inner_success": bool(res.success),
-                "inner_nit": int(res.nit),
-                "inner_fun": float(res.fun),
-                "inner_grad_norm": float(np.linalg.norm(res.jac)) if res.jac is not None else np.nan,
-                "message": str(res.message),
-            }
-        )
-
+        hist.append({
+            "outer_iter": k, "lam": lam, "GI_final": gi, "constraint_residual": c,
+            "inner_success": bool(res.success), "inner_nit": int(res.nit),
+            "inner_fun": float(res.fun),
+            "inner_grad_norm": float(np.linalg.norm(res.jac)) if res.jac is not None else np.nan,
+            "message": str(res.message),
+        })
         if verbose:
-            print(
-                f"[outer {k:02d}] GI={gi:.3e}, lam={lam:.6e}, "
-                f"inner_nit={res.nit}, inner_success={res.success}"
-            )
+            print(f"[outer {k:02d}] GI={gi:.3e}, lam={lam:.6e}, "
+                  f"inner_nit={res.nit}, inner_success={res.success}")
 
     return x, lam, hist
 
 
-# ========== Public API ==========
+# =============================================================================
+# Public API
+# =============================================================================
 
 def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
     """
-    Gate optimisation using the built-in gate_gradient() method from
-    QuantumSystem, which uses TF GradientTape + GateInfidelityCustom
-    (PySTE's gate_switching_function under the hood).
+    Optimize a 2-qubit gate via piecewise-constant exchange coupling pulses.
+
+    The gate entanglement measure used for the entropy constraint is determined
+    by config.gate_ent_measure (default: "operator_entanglement"). Any key in
+    entanglement_measures.GATE_MEASURES is valid.
+
+    Additional measures listed in config.extra_ent_measures are evaluated over
+    the full unitary trajectory and stored in SQEGateResults.extra_ent_initial
+    / extra_ent_final for plotting.
+
+    Parameters
+    ----------
+    config : SimulationConfig
+        Full configuration. Key fields: run_mode, gate_ent_measure,
+        extra_ent_measures, n_time_steps, n_J_channels, T, theta_target,
+        zeeman_splittings, S_max, eps_infidelity.
+
+    Returns
+    -------
+    SQEGateResults
     """
-    # ---- State optimisation: delegate ----
     if config.optimisation_target == "state":
-        raise NotImplementedError(
-            "State optimisation mode requires importing sqe_optimisation as a "
-            "package module. Use sqe_gate_optimisation.py for state mode, or "
-            "add an __init__.py to pulse_vqe_entanglement/ to enable package imports."
-        )
+        raise NotImplementedError("Gate-only module. Use the state optimiser for state mode.")
 
-    # ---- Gate optimisation ----
+    if config.gate_ent_measure not in GATE_MEASURES:
+        raise ValueError(f"Unknown gate_ent_measure: {config.gate_ent_measure!r}. "
+                         f"Valid: {list(GATE_MEASURES)}")
+    for name in config.extra_ent_measures:
+        if name not in GATE_MEASURES:
+            raise ValueError(f"Unknown extra_ent_measure: {name!r}. Valid: {list(GATE_MEASURES)}")
+
     _initialise_seed(config)
-    config.n_J_channels = 1
 
-    sys = _make_system(config)
-    target_gate = single_qubit_excitation(config.theta_target)
+    # Work in the rotating frame with symmetric Zeeman splittings ±ΔB/2.
+    Z = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
+    B1, B2 = config.zeeman_splittings
+    deltaB = (B1 - B2) / 2
+    U_rot = expm(-1j * np.pi * deltaB
+                 * (np.kron(Z, np.eye(2)) - np.kron(np.eye(2), Z))
+                 * config.T * NS_TO_US)
+    target_gate = U_rot @ single_qubit_excitation(config.theta_target)
 
-    dummy_init = np.zeros(4, dtype=np.complex128)
-    dummy_init[0] = 1.0
-    config_copy = SimulationConfig(**vars(config))
-    config_copy.initial_state = dummy_init
-    driven_sys = _make_driven_sys(config_copy, sys)
+    cfg = SimulationConfig(**vars(config))
+    cfg.zeeman_splittings = np.array([deltaB, -deltaB])
 
-    x0 = _initialise_x0(config)
-    bounds = [(-1.0, 1.0)] * len(x0)
+    sys = _make_system(cfg)
+    driven_sys = _make_driven_sys(cfg, sys)
 
-    def _fun_and_jac_gate(x_opt, target):
-        """Gate infidelity and gradient via built-in gate_gradient."""
-        gi, grad = driven_sys.gate_gradient(x_opt, target)
-        return gi, grad
+    x0 = _initialise_x0(cfg)
+    bounds = [(-1.0, 1.0)] * x0.size
 
-    def run_baseline(x_init):
+    # Build TF graphs once; reused by every entanglement cost evaluation.
+    basis_driven_systems = _build_basis_driven_systems(cfg, sys)
+
+    def _solve_infidelity(x_init: np.ndarray):
         res = minimize(
-            _fun_and_jac_gate,
-            x0=x_init,
-            args=(target_gate,),
-            jac=True,
-            bounds=bounds,
-            method="L-BFGS-B",
-            options={"maxiter": int(config.maxiter), "gtol": float(config.gtol)},
+            driven_sys.gate_gradient, x0=np.asarray(x_init, np.float64),
+            args=(target_gate,), jac=True, bounds=bounds, method="L-BFGS-B",
+            options={"maxiter": int(cfg.maxiter), "gtol": float(cfg.gtol)},
         )
+        gn = float(np.linalg.norm(res.jac)) if res.jac is not None else 0.0
+        print(f"GI={float(res.fun):.3e}, nit={res.nit}, success={res.success}, grad_norm={gn:.3e}")
+        return res, gn
 
-        grad_norm = float(np.linalg.norm(res.jac)) if res.jac is not None else 0.0
-        print("Gate infidelity optimisation results:")
-        print(f"GI={float(res.fun):.3e}, nit={res.nit}, success={res.success}, grad_norm={grad_norm:.3e}")
+    def _solve_entropy(x_init: np.ndarray):
+        xf, lam, hist = _primal_dual_optimise(
+            driven_sys, basis_driven_systems, cfg, x_init,
+            target_gate=target_gate, bounds=bounds, verbose=True,
+        )
+        gn = float(np.linalg.norm(np.asarray(driven_sys.gate_gradient(xf, target_gate)[1], float)))
+        ok = bool(hist) and float(hist[-1]["constraint_residual"]) <= 0.0
+        return xf, lam, hist, gn, ok
 
+    if cfg.run_mode == "infidelity":
+        res, gn = _solve_infidelity(x0)
         return _package_gate_results(
-            config=config,
-            sys=sys,
-            target_gate=target_gate,
-            x0=x_init,
-            xf=np.asarray(res.x, float),
-            success=bool(res.success),
-            nit=int(res.nit),
-            grad_norm=grad_norm,
+            config=cfg, sys=sys, target_gate=target_gate,
+            x0=x0, xf=res.x, success=res.success, nit=res.nit, grad_norm=gn,
         )
 
-    def run_ep_constrained(x_init):
-        x_final, lam_final, hist = _primal_dual_optimise(
-            driven_sys,
-            config,
-            sys,
-            x_init,
-            target_gate=target_gate,
-            bounds=bounds,
-            verbose=True,
-        )
-        # Use built-in gate_gradient
-        _, grad_final = driven_sys.gate_gradient(x_final, target_gate)
-        grad_norm = float(np.linalg.norm(np.asarray(grad_final, float)))
-        success = bool(hist) and (float(hist[-1]["constraint_residual"]) <= 0.0)
-
+    if cfg.run_mode == "entropy":
+        xf, lam, hist, gn, ok = _solve_entropy(x0)
         return _package_gate_results(
-            config=config,
-            sys=sys,
-            target_gate=target_gate,
-            x0=x_init,
-            xf=x_final,
-            success=success,
-            nit=len(hist),
-            grad_norm=grad_norm,
-            lam_final=float(lam_final),
-            history=hist,
+            config=cfg, sys=sys, target_gate=target_gate,
+            x0=x0, xf=xf, success=ok, nit=len(hist), grad_norm=gn,
+            lam_final=float(lam), history=hist,
         )
 
-    if config.run_mode == "infidelity":
-        return run_baseline(x0)
+    if cfg.run_mode == "both":
+        res, gn0 = _solve_infidelity(x0.copy())
+        baseline = _package_gate_results(
+            config=cfg, sys=sys, target_gate=target_gate,
+            x0=x0, xf=res.x, success=res.success, nit=res.nit, grad_norm=gn0,
+        )
+        xf, lam, hist, gn, ok = _solve_entropy(x0.copy())
+        return _package_gate_results(
+            config=cfg, sys=sys, target_gate=target_gate,
+            x0=x0, xf=xf, success=ok, nit=len(hist), grad_norm=gn,
+            lam_final=float(lam), history=hist, baseline=baseline,
+        )
 
-    if config.run_mode == "entropy":
-        return run_ep_constrained(x0)
-
-    if config.run_mode == "both":
-        baseline = run_baseline(x0.copy())
-        constrained = run_ep_constrained(x0.copy())
-        constrained.baseline = baseline
-        return constrained
-
-    raise ValueError(f"Unknown run_mode: {config.run_mode!r}")
-
+    raise ValueError(f"Unknown run_mode: {cfg.run_mode!r}")

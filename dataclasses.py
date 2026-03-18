@@ -16,7 +16,7 @@ time is in ns, we convert: dt_μs = dt_ns × NS_TO_US where NS_TO_US = 1e-3.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Literal, Any, Sequence
 import numpy as np
 
@@ -75,9 +75,9 @@ class SimulationConfig:
     Optimization Parameters
     -----------------------
     gtol : float
-        Gradient tolerance for L-BFGS-B. Default: 1e-5.
+        Gradient tolerance for L-BFGS-B. Default: 1e-12.
     maxiter : int
-        Maximum iterations for baseline optimization. Default: 30.
+        Maximum iterations for baseline optimization. Default: 200.
     run_mode : RunMode
         Optimization mode: "infidelity" (minimize infidelity only),
         "entropy" (entropy-constrained), or "both" (run both). Default: "infidelity".
@@ -85,7 +85,7 @@ class SimulationConfig:
     Entropy Constraint (Primal-Dual)
     ---------------------------------
     S_max : float
-        Maximum allowed entanglement entropy (bits). Default: 0.05.
+        Maximum allowed entanglement (in units of the chosen measure). Default: 0.05.
     eps_infidelity : float
         Target infidelity threshold for constraint. Default: 1e-8.
     rho : float
@@ -98,6 +98,19 @@ class SimulationConfig:
         Maximum inner L-BFGS-B iterations per outer step. Default: 200.
     fd_eps : float
         Finite difference step for entropy gradient. Default: 1e-5.
+
+    Entanglement Measure Selection
+    --------------------------------
+    state_ent_measure : str
+        State entanglement measure used in sqe_state.py optimization.
+        Any key in entanglement_measures.STATE_MEASURES. Default: "von_neumann".
+    gate_ent_measure : str
+        Gate entanglement measure used in sqe_gate.py optimization.
+        Any key in entanglement_measures.GATE_MEASURES. Default: "operator_entanglement".
+    extra_ent_measures : list[str]
+        Additional measures to plot on separate axes (not used in optimization).
+        Can mix state or gate measure names depending on the optimisation_target.
+        Default: [] (no extra panels).
 
     System-Specific
     ---------------
@@ -132,12 +145,13 @@ class SimulationConfig:
     J_max: float = 10.0
     J_min: float = 0.0
     J_init_scale: float = 1e-3
+    J_init_mean: float = 0.0
     J_init_seed: Optional[int] = None
     feromagnetic: bool = False
 
     # Baseline optimization
-    gtol: float = 1e-10
-    maxiter: int = 30
+    gtol: float = 1e-12
+    maxiter: int = 200
     run_mode: RunMode = "infidelity"
     optimisation_target: OptimisationTarget = "state"
 
@@ -150,16 +164,24 @@ class SimulationConfig:
     inner_maxiter: int = 200
     fd_eps: float = 1e-5
 
+    # Entanglement measure selection
+    state_ent_measure: str = "von_neumann"
+    gate_ent_measure: str = "operator_entanglement"
+    extra_ent_measures: list = field(default_factory=list)
+
     # Reproducibility and system configuration
-    init_seed: Optional[int] = None
     entropy_subsystem: Optional[Sequence[int]] = None
     n_J_channels: int = 1
+
+    # DQE plotting: list of bipartitions (tuples of qubit indices) to plot
+    # separately. E.g. [(0,1), (0,), (2,3)]. Each generates one extra panel.
+    dqe_plot_partitions: list = field(default_factory=list)
 
 
 @dataclass
 class SQEResults:
     """
-    Results from quantum gate optimization (SQE or DQE).
+    Results from state-based SQE/DQE optimization.
 
     Note: Despite the name "SQE", this dataclass is used for both Single Qubit
     Excitation (SQE) and Double Qubit Excitation (DQE) results for backward
@@ -224,29 +246,30 @@ class SQEResults:
 @dataclass
 class SQEGateResults:
     """
-    Results from gate-based quantum gate optimization.
-
-    Supports both gate infidelity and state infidelity optimization modes.
-    Field semantics depend on config.optimisation_target:
-    - "gate": infid_* contains gate infidelity, ent_* contains operator entanglement.
-    - "state": infid_* contains state infidelity, ent_* contains entanglement entropy.
+    Results from gate-based SQE optimization.
 
     Attributes
     ----------
     config : SimulationConfig
         Configuration used for this optimization run.
     x0 : np.ndarray
-        Initial control parameters, shape (n_time_steps x n_J_channels,).
+        Initial control parameters, shape (n_time_steps × n_J_channels,).
     x_final : np.ndarray
-        Optimized control parameters, shape (n_time_steps x n_J_channels,).
+        Optimized control parameters, shape (n_time_steps × n_J_channels,).
     infid_initial : np.ndarray
         Infidelity trajectory for initial parameters, shape (n_fine + 1,).
     infid_final : np.ndarray
         Infidelity trajectory for optimized parameters, shape (n_fine + 1,).
     ent_initial : np.ndarray
-        Entanglement measure trajectory for initial parameters, shape (n_fine + 1,).
+        Trajectory of config.gate_ent_measure for initial parameters,
+        shape (n_fine + 1,).
     ent_final : np.ndarray
-        Entanglement measure trajectory for optimized parameters, shape (n_fine + 1,).
+        Trajectory of config.gate_ent_measure for optimized parameters,
+        shape (n_fine + 1,).
+    extra_ent_initial : dict[str, np.ndarray]
+        Trajectories for each measure in config.extra_ent_measures (initial x).
+    extra_ent_final : dict[str, np.ndarray]
+        Trajectories for each measure in config.extra_ent_measures (final x).
     gradient_norm : float
         Final gradient norm at convergence.
     n_iterations : int
@@ -272,6 +295,9 @@ class SQEGateResults:
     ent_initial: np.ndarray
     ent_final: np.ndarray
 
+    extra_ent_initial: dict = field(default_factory=dict)
+    extra_ent_final: dict = field(default_factory=dict)
+
     gradient_norm: float = 0.0
     n_iterations: int = 0
     optimization_success: bool = False
@@ -279,3 +305,62 @@ class SQEGateResults:
     lam_final: Optional[float] = None
     history: Optional[list[dict[str, Any]]] = None
     baseline: Optional["SQEGateResults"] = None
+
+
+@dataclass
+class DQEResults:
+    """
+    Results from Double Qubit Excitation (DQE) state optimization.
+
+    4-spin chain with 3 nearest-neighbor J channels. The control parameter
+    vector x has shape (n_time_steps * 3,) — the 3 channels are interleaved
+    as x.reshape(n_time_steps, 3).
+
+    Attributes
+    ----------
+    config : SimulationConfig
+        Configuration used for this optimization run.
+    x0 : np.ndarray
+        Initial control parameters, shape (n_time_steps * 3,).
+    x_final : np.ndarray
+        Optimized control parameters, shape (n_time_steps * 3,).
+    val0 : np.ndarray
+        Initial infidelity trajectory (fine grid), shape (n_fine + 1,).
+    val_final : np.ndarray
+        Final infidelity trajectory (fine grid), shape (n_fine + 1,).
+    initial_traj : np.ndarray
+        Initial state trajectory, shape (16, n_fine + 1).
+    final_traj : np.ndarray
+        Final state trajectory, shape (16, n_fine + 1).
+    gradient_norm : float
+        Final gradient norm at convergence.
+    n_iterations : int
+        Number of optimization iterations performed.
+    optimization_success : bool
+        Whether optimization converged successfully.
+    lam_final : Optional[float]
+        Final Lagrange multiplier (entropy-constrained mode only).
+    history : Optional[list[dict]]
+        Per-outer-iteration diagnostics (entropy-constrained mode only).
+    baseline : Optional[DQEResults]
+        Infidelity-only result attached when run_mode="both".
+    """
+
+    config: SimulationConfig
+
+    x0: np.ndarray
+    x_final: np.ndarray
+
+    val0: np.ndarray
+    val_final: np.ndarray
+
+    initial_traj: np.ndarray
+    final_traj: np.ndarray
+
+    gradient_norm: float = 0.0
+    n_iterations: int = 0
+    optimization_success: bool = False
+
+    lam_final: Optional[float] = None
+    history: Optional[list[dict[str, Any]]] = None
+    baseline: Optional["DQEResults"] = None
