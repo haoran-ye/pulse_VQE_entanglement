@@ -6,28 +6,16 @@ nearest-neighbor chain) to implement a target DQE gate — a rotation in the
 |0011⟩ ↔ |1100⟩ subspace — while optionally minimizing multipartite
 entanglement via primal-dual methods.
 
-Run modes (config.run_mode)
----------------------------
-"infidelity" : Minimize state infidelity only (autodiff gradient).
-"entropy"    : Minimize sum-of-bipartite-entropies subject to infidelity ≤ ε,
-               using finite-difference gradients for the entropy cost.
-"both"       : Run "infidelity" first, then "entropy" from the same x0;
-               returns the constrained result with the baseline attached.
+entanglement_optimisation flag
+-------------------------------
+False : Minimize state infidelity only (uses QuGrad autodiff gradient).
+True  : First minimize infidelity, then run the entropy-constrained primal-dual
+        loop from the same x0; baseline result stored in results.baseline.
 
 Frame transformation
 --------------------
-Mirrors sqe_state.py.  Given user-supplied Zeeman splittings [B1,B2,B3,B4]
-for the four spins, we work in the rotating frame that removes the free
-precession of the |0011⟩ ↔ |1100⟩ transition.  The effective splitting is
-
-    deltaB = (B1 + B2 - B3 - B4) / 4
-
-and the SpinChain is constructed with symmetric splittings
-[+deltaB, +deltaB, -deltaB, -deltaB].  The frame unitary
-
-    U_rot = expm(-i π deltaB (Z₁+Z₂-Z₃-Z₄) T [ns→µs])
-
-dresses the target gate before forming the observable.
+The system is constructed in the rotating frame of the average Zeeman splitting, 
+while the infidelity observable is constructed in the frame of each qubit.  
 
 Entanglement cost
 -----------------
@@ -70,11 +58,13 @@ def dqe_unitary(theta: float) -> np.ndarray:
         |0011⟩ →  cos(θ)|0011⟩ - sin(θ)|1100⟩
         |1100⟩ →  sin(θ)|0011⟩ + cos(θ)|1100⟩
     """
-    U = np.eye(16, dtype=np.complex128)
+    U_dqe = np.eye(16, dtype=np.complex128)
     c, s = np.cos(theta), np.sin(theta)
-    U[3, 3] =  c;  U[3, 12] = -s
-    U[12, 3] =  s;  U[12, 12] =  c
-    return U
+    U_dqe[3, 3] =  c  
+    U_dqe[3, 12] = -s
+    U_dqe[12, 3] = s  
+    U_dqe[12, 12] = c
+    return U_dqe
 
 
 def basis_state(n_qubits: int, bitstring: str) -> np.ndarray:
@@ -111,17 +101,17 @@ def _make_system_and_observable(config: SimulationConfig):
     I2 = np.eye(2, dtype=np.complex128)
     Z  = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
 
-    Z1 = np.kron(Z, np.kron(I2, np.kron(I2, I2)))
-    Z2 = np.kron(I2, np.kron(Z, np.kron(I2, I2)))
-    Z3 = np.kron(I2, np.kron(I2, np.kron(Z, I2)))
-    Z4 = np.kron(I2, np.kron(I2, np.kron(I2, Z)))
+    Z0 = np.kron(Z, np.kron(I2, np.kron(I2, I2)))
+    Z1 = np.kron(I2, np.kron(Z, np.kron(I2, I2)))
+    Z2 = np.kron(I2, np.kron(I2, np.kron(Z, I2)))
+    Z3 = np.kron(I2, np.kron(I2, np.kron(I2, Z)))
 
-    B = np.array(config.zeeman_splittings, dtype=float)
+    B = np.array(config.zeeman_splittings, dtype=np.float64)
     B_avg = np.mean(B)
-    deltaB = np.array(B - B_avg, dtype=float)
+    deltaB = B - B_avg
 
     U_rot = expm(-1j * np.pi 
-                 * (deltaB[0] * Z1 + deltaB[1] * Z2 - deltaB[2] * Z3 - deltaB[3] * Z4) 
+                 * (deltaB[0] * Z0 + deltaB[1] * Z1 + deltaB[2] * Z2 + deltaB[3] * Z3) 
                  * config.T * NS_TO_US)
 
     target_state = U_rot @ dqe_unitary(config.theta_target) @ config.initial_state
@@ -147,8 +137,8 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
     grid and repeated n_discretisation times to obtain the fine grid.
     """
     n_steps = config.n_time_steps
-    n_disc  = config.n_discretisation
-    n_fine  = n_steps * n_disc
+    n_disc = config.n_discretisation
+    n_fine = n_steps * n_disc
     dt_fine_us = (config.T / n_fine) * NS_TO_US
 
     def pulse_function(x):
@@ -198,6 +188,10 @@ def _cost_entropy(driven_sys, x, *, S_max: float) -> float:
     where Σ_P sums over all 7 bipartitions in ALL_BIPARTITIONS_4Q.
     """
     traj = np.asarray(driven_sys.propagate_all(x))   # (16, n_t)
+
+    # test: optimise the entropy between 01 and 23 only
+    #total_S = np.sum(entropy_bipartite_traj(traj, subsystem=(0,1), n_qubits=4))
+
     total_S = entropy_sum_traj(traj)
     viol = np.maximum(0.0, total_S - S_max)
     return float(np.mean(viol ** 2))
@@ -278,12 +272,14 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds,
         )
         x = np.asarray(res.x, float)
 
-        infidelity = float(np.real(driven_sys.gradient(x, observable)[0]))
-        c   = infidelity - float(config.eps_infidelity)
+        S = _cost_entropy(driven_sys, x, S_max=float(config.S_max))
+
+        infidelity = np.real(driven_sys.gradient(x, observable)[0])
+        c = infidelity - float(config.eps_infidelity)
         lam = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
-            "outer_iter": k, "lam": lam, "I_final": infidelity,
+            "outer_iter": k, "lam": lam, "I_final": infidelity, "S": S,
             "constraint_residual": c,
             "inner_success": bool(res.success), "inner_nit": int(res.nit),
             "inner_fun": float(res.fun),
@@ -292,7 +288,8 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds,
         })
         if verbose:
             print(f"[outer {k:02d}] I={infidelity:.3e}, lam={lam:.6e}, "
-                  f"inner_nit={res.nit}, inner_success={res.success}")
+                  f"inner_nit={res.nit}, inner_success={res.success}, "
+                  f"constraint_residual={c:.3e}, S={S:.3e}")
 
     return x, lam, hist
 
@@ -315,8 +312,9 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
     Parameters
     ----------
     config : SimulationConfig
-        Key fields: run_mode, theta_target, zeeman_splittings (length 4),
-        initial_state (length 16), T, n_time_steps, S_max, eps_infidelity.
+        Key fields: entanglement_optimisation, theta_target,
+        zeeman_splittings (length 4), initial_state (length 16),
+        T, n_time_steps, S_max, eps_infidelity.
 
     Returns
     -------
@@ -328,7 +326,7 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
     sys, observable = _make_system_and_observable(config)
     driven_sys = _make_driven_sys(config, sys)
 
-    x0     = _initialise_x0(config)
+    x0 = _initialise_x0(config)
     bounds = [(-1.0, 1.0)] * len(x0)
 
     def run_baseline(x_init):
@@ -338,8 +336,9 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
             options={"maxiter": int(config.maxiter), "gtol": float(config.gtol)},
         )
         gn = float(np.linalg.norm(res.jac)) if res.jac is not None else 0.0
+        S = _cost_entropy(driven_sys, res.x, S_max=float(config.S_max))
         print(f"Infidelity: I={res.fun:.3e}, nit={res.nit}, "
-              f"success={res.success}, grad_norm={gn:.3e}")
+              f"success={res.success}, grad_norm={gn:.3e}", f"S={S:.3e}")
         return _package_results(
             config=config, driven_sys=driven_sys, observable=observable,
             x0=x_init, xf=np.asarray(res.x, float),
@@ -361,16 +360,10 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
             lam_final=float(lam), history=hist,
         )
 
-    if config.run_mode == "infidelity":
+    if not config.entanglement_optimisation:
         return run_baseline(x0)
 
-    if config.run_mode == "entropy":
-        return run_entropy(x0)
-
-    if config.run_mode == "both":
-        baseline    = run_baseline(x0.copy())
-        constrained = run_entropy(x0.copy())
-        constrained.baseline = baseline
-        return constrained
-
-    raise ValueError(f"Unknown run_mode: {config.run_mode!r}")
+    baseline = run_baseline(x0.copy())
+    constrained = run_entropy(x0.copy())
+    constrained.baseline = baseline
+    return constrained

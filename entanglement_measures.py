@@ -148,8 +148,8 @@ def entropy_bipartite_single(state: np.ndarray, *,
         Total number of qubits.
     """
     psi_AB = _reshape_state_for_partition(state, tuple(subsystem), n_qubits)
-    rho_A  = psi_AB @ psi_AB.conj().T
-    eig    = np.clip(np.linalg.eigvalsh(rho_A), 1e-15, 1.0)
+    rho_A = psi_AB @ psi_AB.conj().T
+    eig = np.clip(np.linalg.eigvalsh(rho_A), 1e-15, 1.0)
     return float(-np.sum(eig * np.log2(eig)))
 
 
@@ -175,7 +175,7 @@ def entropy_bipartite_traj(traj: np.ndarray, *,
     ])
 
 
-# All distinct bipartite partitions of 4 qubits (|A| ≤ n/2 avoids double-counting)
+# All distinct bipartite partitions of 4 qubits
 ALL_BIPARTITIONS_4Q: tuple[tuple[int, ...], ...] = (
     (0,), (1,), (2,), (3,),      # four single-qubit cuts
     (0, 1), (0, 2), (0, 3),      # three two-qubit cuts
@@ -213,7 +213,7 @@ def entropy_sum_traj(traj: np.ndarray, *, n_qubits=4) -> np.ndarray:
 
 
 # =============================================================================
-# Gate entanglement measures
+# Gate entanglement measures — 2-qubit (4×4 unitaries)
 # =============================================================================
 
 def operator_entanglement(U: np.ndarray) -> float:
@@ -282,6 +282,50 @@ gate_entanglement = operator_entanglement
 
 
 # =============================================================================
+# Gate entanglement measures — n-qubit (general, used by DQE gate)
+# =============================================================================
+
+def operator_entanglement_bipartite(U: np.ndarray, *,
+                                     subsystem=(0, 1), n_qubits=4) -> float:
+    """
+    Operator entanglement for an n-qubit gate over bipartition subsystem|rest.
+
+    Reshapes U as a bilinear map (A_out ⊗ B_out) ← (A_in ⊗ B_in), computes
+    the operator Schmidt decomposition via SVD, and returns the Shannon entropy
+    of the squared singular values.  Normalised so that Σ p_i = 1 for unitary U.
+
+    Convention matches operator_entanglement for 2-qubit gates: divide by
+    sqrt(2^n_qubits) before SVD.
+    """
+    n = n_qubits
+    A = tuple(subsystem)
+    B = tuple(q for q in range(n) if q not in A)
+    # Reshape U (2^n × 2^n): axes 0..n-1 = output qubits, axes n..2n-1 = input qubits
+    U_r = U.reshape((2,) * (2 * n))
+    # Permute to (A_out, A_in, B_out, B_in), then reshape to (dim_A², dim_B²)
+    perm = tuple(A) + tuple(a + n for a in A) + tuple(B) + tuple(b + n for b in B)
+    T = U_r.transpose(perm).reshape(4 ** len(A), 4 ** len(B))
+    T = T / np.sqrt(2 ** n)
+    s = np.linalg.svd(T, compute_uv=False)
+    p = s ** 2
+    p = p[p > 1e-15]
+    return float(-np.sum(p * np.log2(p)))
+
+
+def operator_entanglement_sum_4q(U: np.ndarray) -> float:
+    """
+    Sum of operator entanglement over all 7 distinct bipartitions of a 4-qubit gate.
+
+    Analogous to entropy_sum_single for states: sums operator_entanglement_bipartite
+    over ALL_BIPARTITIONS_4Q.  Used as the default DQE gate entanglement cost.
+    """
+    return sum(
+        operator_entanglement_bipartite(U, subsystem=p, n_qubits=4)
+        for p in ALL_BIPARTITIONS_4Q
+    )
+
+
+# =============================================================================
 # Lookup registries
 # =============================================================================
 
@@ -304,33 +348,42 @@ STATE_MEASURE_TITLES: dict[str, str] = {
 """Panel titles for state entanglement plots."""
 
 GATE_MEASURES: dict[str, object] = {
-    "operator_entanglement":     operator_entanglement,
-    "average_entangling_power":  average_entangling_power,
-    "max_output_entanglement":   max_output_entanglement,
-    "assisted_entangling_power": assisted_entangling_power,
+    # 2-qubit (4×4 unitary)
+    "operator_entanglement":        operator_entanglement,
+    "average_entangling_power":     average_entangling_power,
+    "max_output_entanglement":      max_output_entanglement,
+    "assisted_entangling_power":    assisted_entangling_power,
+    # 4-qubit (16×16 unitary)
+    "operator_entanglement_sum_4q": operator_entanglement_sum_4q,
 }
 """Registry: name -> fn(U) -> float for gate entanglement measures."""
 
+# Names of measures valid for 4-qubit (16×16) gates
+GATE_MEASURES_4Q: frozenset[str] = frozenset({"operator_entanglement_sum_4q"})
+
 GATE_MEASURE_LABELS: dict[str, str] = {
-    "operator_entanglement":     "Operator Entanglement (bits)",
-    "average_entangling_power":  "Avg. Entangling Power (bits)",
-    "max_output_entanglement":   "Max Output Entanglement (bits)",
-    "assisted_entangling_power": "Assisted Entangling Power (bits)",
+    "operator_entanglement":        "Operator Entanglement (bits)",
+    "average_entangling_power":     "Avg. Entangling Power (bits)",
+    "max_output_entanglement":      "Max Output Entanglement (bits)",
+    "assisted_entangling_power":    "Assisted Entangling Power (bits)",
+    "operator_entanglement_sum_4q": r"$\Sigma_P$ Op. Entanglement (bits)",
 }
 """Y-axis labels for gate entanglement plots."""
 
 GATE_MEASURE_TITLES: dict[str, str] = {
-    "operator_entanglement":     "Operator Entanglement Evolution",
-    "average_entangling_power":  "Average Entangling Power Evolution",
-    "max_output_entanglement":   "Max Output Entanglement Evolution",
-    "assisted_entangling_power": "Assisted Entangling Power Evolution",
+    "operator_entanglement":        "Operator Entanglement Evolution",
+    "average_entangling_power":     "Average Entangling Power Evolution",
+    "max_output_entanglement":      "Max Output Entanglement Evolution",
+    "assisted_entangling_power":    "Assisted Entangling Power Evolution",
+    "operator_entanglement_sum_4q": "Total Operator Entanglement (sum over 7 bipartitions)",
 }
 """Panel titles for gate entanglement plots."""
 
 GATE_MEASURE_DETERMINISTIC: dict[str, bool] = {
-    "operator_entanglement":     True,
-    "average_entangling_power":  False,
-    "max_output_entanglement":   False,
-    "assisted_entangling_power": False,
+    "operator_entanglement":        True,
+    "average_entangling_power":     False,
+    "max_output_entanglement":      False,
+    "assisted_entangling_power":    False,
+    "operator_entanglement_sum_4q": True,
 }
 """True for measures cheap enough to evaluate a target line at plot time."""

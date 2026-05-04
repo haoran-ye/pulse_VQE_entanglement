@@ -4,13 +4,11 @@ Single Qubit Excitation (SQE) optimization for 2-spin systems.
 Optimizes piecewise-constant exchange coupling pulses to implement single-qubit
 gates while optionally constraining entanglement entropy via primal-dual methods.
 
-Run modes (config.run_mode)
----------------------------
-"infidelity" : Minimize state infidelity only (uses QuGrad autodiff gradient).
-"entropy"    : Minimize entanglement subject to infidelity ≤ ε,
-               using finite-difference gradients for the entanglement cost.
-"both"       : Run "infidelity" first, then "entropy" from the same x0;
-               returns the constrained result with the baseline attached.
+entanglement_optimisation flag
+-------------------------------
+False : Minimize state infidelity only (uses QuGrad autodiff gradient).
+True  : First minimize infidelity, then run the entropy-constrained primal-dual
+        loop from the same x0; baseline result stored in results.baseline.
 
 Entanglement measure
 --------------------
@@ -76,18 +74,24 @@ def _make_system_and_observable(config: SimulationConfig):
     The system is constructed in the rotating frame (symmetric Zeeman splittings
     ±ΔB/2) and the target state is dressed by the corresponding frame unitary.
     """
+    I2 = np.eye(2, dtype=np.complex128)
     Z = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
-    B1, B2 = config.zeeman_splittings
-    deltaB = (B1 - B2) / 2 # or B1-B_avg
-    U_rot = expm(-1j * np.pi * deltaB
-                 * (np.kron(Z, np.eye(2)) - np.kron(np.eye(2), Z))
+    Z1 = np.kron(Z, I2)
+    Z2 = np.kron(I2, Z)
+
+    B = np.array(config.zeeman_splittings, dtype=np.float64)
+    B_avg = np.mean(B)
+    deltaB = B - B_avg
+    U_rot = expm(-1j * np.pi 
+                 * (deltaB[0] * Z1 + deltaB[1] * Z2) 
                  * config.T * NS_TO_US)
+
     target_state = U_rot @ single_qubit_excitation(config.theta_target) @ config.initial_state
     observable = np.eye(4, dtype=np.complex128) - np.outer(target_state, target_state.conj())
 
     sys = SpinChain(
         spins=2,
-        zeeman_splittings=np.array([deltaB, -deltaB]),
+        zeeman_splittings=deltaB,
         max_drive_strength=config.max_drive_strength,
         J_max=config.J_max,
         J_min=config.J_min,
@@ -200,7 +204,7 @@ def _lagrangian_and_grad(driven_sys, x, *, observable, lam, S_max, fd_eps,
     gS = _entropy_grad_fd(driven_sys, x, S_max=S_max, eps=fd_eps, ent_traj_fn=ent_traj_fn, f0=S)
 
     infidelity, grad_inf = driven_sys.gradient(x, observable)
-    infidelity = float(np.real(infidelity))
+    infidelity = max(0.0, float(np.real(infidelity)))   # guard against float64 cancellation
     grad_inf = np.asarray(grad_inf, float)
     c = infidelity - eps_infidelity
 
@@ -245,12 +249,14 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds, config: Simulat
         )
         x = np.asarray(res.x, float)
 
-        infidelity = float(np.real(driven_sys.gradient(x, observable)[0]))
+        S = _cost_entropy(driven_sys, x, S_max=float(config.S_max), ent_traj_fn=ent_traj_fn)
+
+        infidelity = np.real(driven_sys.gradient(x, observable)[0])
         c = infidelity - float(config.eps_infidelity)
         lam = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
-            "outer_iter": k, "lam": lam, "I_final": infidelity, "constraint_residual": c,
+            "outer_iter": k, "lam": lam, "I_final": infidelity, "constraint_residual": c, "S": S,
             "inner_success": bool(res.success), "inner_nit": int(res.nit),
             "inner_fun": float(res.fun),
             "inner_grad_norm": float(np.linalg.norm(res.jac)) if res.jac is not None else np.nan,
@@ -258,7 +264,8 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds, config: Simulat
         })
         if verbose:
             print(f"[outer {k:02d}] I={infidelity:.3e}, lam={lam:.6e}, "
-                  f"inner_nit={res.nit}, inner_success={res.success}")
+                  f"inner_nit={res.nit}, inner_success={res.success}, "
+                  f"constraint_residual={c:.3e}, S={S:.3e}")
 
     return x, lam, hist
 
@@ -278,9 +285,9 @@ def sqe_optimisation(config: SimulationConfig) -> SQEResults:
     Parameters
     ----------
     config : SimulationConfig
-        Full configuration. Key fields: run_mode, state_ent_measure,
-        n_time_steps, T, theta_target, zeeman_splittings, initial_state,
-        S_max, eps_infidelity.
+        Full configuration. Key fields: entanglement_optimisation,
+        state_ent_measure, n_time_steps, T, theta_target, zeeman_splittings,
+        initial_state, S_max, eps_infidelity.
 
     Returns
     -------
@@ -308,7 +315,8 @@ def sqe_optimisation(config: SimulationConfig) -> SQEResults:
             options={"maxiter": int(config.maxiter), "gtol": float(config.gtol)},
         )
         gn = float(np.linalg.norm(res.jac)) if res.jac is not None else 0.0
-        print(f"Infidelity: I={res.fun:.3e}, nit={res.nit}, success={res.success}, grad_norm={gn:.3e}")
+        S = _cost_entropy(driven_sys, res.x, S_max=float(config.S_max), ent_traj_fn=ent_traj_fn)
+        print(f"Infidelity: I={res.fun:.3e}, nit={res.nit}, success={res.success}, grad_norm={gn:.3e}, S={S:.3e}")
         return _package_results(
             config=config, driven_sys=driven_sys, observable=observable,
             x0=x_init, xf=np.asarray(res.x, float),
@@ -328,16 +336,10 @@ def sqe_optimisation(config: SimulationConfig) -> SQEResults:
             lam_final=float(lam), history=hist,
         )
 
-    if config.run_mode == "infidelity":
+    if not config.entanglement_optimisation:
         return run_baseline(x0)
 
-    if config.run_mode == "entropy":
-        return run_entropy(x0)
-
-    if config.run_mode == "both":
-        baseline = run_baseline(x0.copy())
-        constrained = run_entropy(x0.copy())
-        constrained.baseline = baseline
-        return constrained
-
-    raise ValueError(f"Unknown run_mode: {config.run_mode!r}")
+    baseline = run_baseline(x0.copy())
+    constrained = run_entropy(x0.copy())
+    constrained.baseline = baseline
+    return constrained

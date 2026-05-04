@@ -5,13 +5,11 @@ Optimizes piecewise-constant exchange coupling pulses to implement a target
 2-qubit gate, with optional operator-entanglement constraints via an augmented
 Lagrangian primal-dual method.
 
-Run modes (config.run_mode)
----------------------------
-"infidelity" : Minimize gate infidelity only (uses QuGrad autodiff gradient).
-"entropy"    : Minimize operator entanglement subject to infidelity ≤ ε,
-               using finite-difference gradients for the entanglement cost.
-"both"       : Run "infidelity" first, then "entropy" from the same x0;
-               returns the constrained result with the baseline attached.
+entanglement_optimisation flag
+-------------------------------
+False : Minimize gate infidelity only (uses QuGrad autodiff gradient).
+True  : First minimize infidelity, then run the entanglement-constrained
+        primal-dual loop from the same x0; baseline stored in results.baseline.
 
 Entanglement measure
 --------------------
@@ -41,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy.optimize import minimize
 from scipy.linalg import expm
 
-from .dataclasses import SimulationConfig, SQEGateResults
+from .dataclasses import SimulationConfig, SQEGateResults, NS_TO_US
 from .entanglement_measures import (
     GATE_MEASURES,
     operator_entanglement,
@@ -54,8 +52,6 @@ sys.path.insert(0, os.path.join(_PROJECT_DIR, "QuGrad-Private", "src"))
 sys.path.insert(0, os.path.join(_PROJECT_DIR, "QuGradLab-Private", "src"))
 
 from qugradlab.systems.semiconducting.esr import SpinChain
-
-NS_TO_US = 1e-3
 
 
 # =============================================================================
@@ -342,16 +338,19 @@ def _primal_dual_optimise(
         c = gi - float(config.eps_infidelity)
         lam = max(0.0, lam + float(config.dual_lr) * c)
 
+        EP = _cost_entangling_power(basis_driven_systems, config, x, ep_max=ep_max)
+
         hist.append({
             "outer_iter": k, "lam": lam, "GI_final": gi, "constraint_residual": c,
             "inner_success": bool(res.success), "inner_nit": int(res.nit),
             "inner_fun": float(res.fun),
             "inner_grad_norm": float(np.linalg.norm(res.jac)) if res.jac is not None else np.nan,
+            "EP": EP,
             "message": str(res.message),
         })
         if verbose:
             print(f"[outer {k:02d}] GI={gi:.3e}, lam={lam:.6e}, "
-                  f"inner_nit={res.nit}, inner_success={res.success}")
+                  f"inner_nit={res.nit}, inner_success={res.success}, EP={EP:.3e}")
 
     return x, lam, hist
 
@@ -375,9 +374,9 @@ def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
     Parameters
     ----------
     config : SimulationConfig
-        Full configuration. Key fields: run_mode, gate_ent_measure,
-        extra_ent_measures, n_time_steps, n_J_channels, T, theta_target,
-        zeeman_splittings, S_max, eps_infidelity.
+        Full configuration. Key fields: entanglement_optimisation,
+        gate_ent_measure, extra_ent_measures, n_time_steps, n_J_channels,
+        T, theta_target, zeeman_splittings, S_max, eps_infidelity.
 
     Returns
     -------
@@ -396,19 +395,32 @@ def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
     _initialise_seed(config)
 
     # Work in the rotating frame with symmetric Zeeman splittings ±ΔB/2.
+
+    I2 = np.eye(2, dtype=np.complex128)
     Z = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
-    B1, B2 = config.zeeman_splittings
-    deltaB = (B1 - B2) / 2
-    U_rot = expm(-1j * np.pi * deltaB
-                 * (np.kron(Z, np.eye(2)) - np.kron(np.eye(2), Z))
+    Z1 = np.kron(Z, I2)
+    Z2 = np.kron(I2, Z)
+
+    B = np.array(config.zeeman_splittings, dtype=np.float64)
+    B_avg = np.mean(B)
+    deltaB = B - B_avg
+
+    U_rot = expm(-1j * np.pi 
+                 * (deltaB[0] * Z1 + deltaB[1] * Z2) 
                  * config.T * NS_TO_US)
+
     target_gate = U_rot @ single_qubit_excitation(config.theta_target)
 
     cfg = SimulationConfig(**vars(config))
-    cfg.zeeman_splittings = np.array([deltaB, -deltaB])
+    cfg.zeeman_splittings = deltaB
 
     sys = _make_system(cfg)
     driven_sys = _make_driven_sys(cfg, sys)
+
+    # For checking that the driven system has the expected gate_gradient method.
+    #print(type(driven_sys))
+    #print(hasattr(driven_sys, "gate_gradient"))
+    #print([name for name in dir(driven_sys) if "grad" in name or "gate" in name])
 
     x0 = _initialise_x0(cfg)
     bounds = [(-1.0, 1.0)] * x0.size
@@ -423,7 +435,8 @@ def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
             options={"maxiter": int(cfg.maxiter), "gtol": float(cfg.gtol)},
         )
         gn = float(np.linalg.norm(res.jac)) if res.jac is not None else 0.0
-        print(f"GI={float(res.fun):.3e}, nit={res.nit}, success={res.success}, grad_norm={gn:.3e}")
+        EP = _cost_entangling_power(basis_driven_systems, cfg, res.x, ep_max=float(cfg.S_max))
+        print(f"GI={float(res.fun):.3e}, nit={res.nit}, success={res.success}, grad_norm={gn:.3e}, EP={EP:.3e}")
         return res, gn
 
     def _solve_entropy(x_init: np.ndarray):
@@ -433,34 +446,25 @@ def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
         )
         gn = float(np.linalg.norm(np.asarray(driven_sys.gate_gradient(xf, target_gate)[1], float)))
         ok = bool(hist) and float(hist[-1]["constraint_residual"]) <= 0.0
+        EP = _cost_entangling_power(basis_driven_systems, cfg, xf, ep_max=float(cfg.S_max))
+        print(f"Final EP={EP:.3e}")
         return xf, lam, hist, gn, ok
 
-    if cfg.run_mode == "infidelity":
+    if not cfg.entanglement_optimisation:
         res, gn = _solve_infidelity(x0)
         return _package_gate_results(
             config=cfg, sys=sys, target_gate=target_gate,
             x0=x0, xf=res.x, success=res.success, nit=res.nit, grad_norm=gn,
         )
 
-    if cfg.run_mode == "entropy":
-        xf, lam, hist, gn, ok = _solve_entropy(x0)
-        return _package_gate_results(
-            config=cfg, sys=sys, target_gate=target_gate,
-            x0=x0, xf=xf, success=ok, nit=len(hist), grad_norm=gn,
-            lam_final=float(lam), history=hist,
-        )
-
-    if cfg.run_mode == "both":
-        res, gn0 = _solve_infidelity(x0.copy())
-        baseline = _package_gate_results(
-            config=cfg, sys=sys, target_gate=target_gate,
-            x0=x0, xf=res.x, success=res.success, nit=res.nit, grad_norm=gn0,
-        )
-        xf, lam, hist, gn, ok = _solve_entropy(x0.copy())
-        return _package_gate_results(
-            config=cfg, sys=sys, target_gate=target_gate,
-            x0=x0, xf=xf, success=ok, nit=len(hist), grad_norm=gn,
-            lam_final=float(lam), history=hist, baseline=baseline,
-        )
-
-    raise ValueError(f"Unknown run_mode: {cfg.run_mode!r}")
+    res, gn0 = _solve_infidelity(x0.copy())
+    baseline = _package_gate_results(
+        config=cfg, sys=sys, target_gate=target_gate,
+        x0=x0, xf=res.x, success=res.success, nit=res.nit, grad_norm=gn0,
+    )
+    xf, lam, hist, gn, ok = _solve_entropy(x0.copy())
+    return _package_gate_results(
+        config=cfg, sys=sys, target_gate=target_gate,
+        x0=x0, xf=xf, success=ok, nit=len(hist), grad_norm=gn,
+        lam_final=float(lam), history=hist, baseline=baseline,
+    )

@@ -24,7 +24,6 @@ import numpy as np
 # Unit conversion: nanoseconds to microseconds
 NS_TO_US = 1e-3  # 1 ns = 0.001 μs
 
-RunMode = Literal["infidelity", "entropy", "both"]
 OptimisationTarget = Literal["state", "gate"]
 
 
@@ -78,9 +77,10 @@ class SimulationConfig:
         Gradient tolerance for L-BFGS-B. Default: 1e-12.
     maxiter : int
         Maximum iterations for baseline optimization. Default: 200.
-    run_mode : RunMode
-        Optimization mode: "infidelity" (minimize infidelity only),
-        "entropy" (entropy-constrained), or "both" (run both). Default: "infidelity".
+    entanglement_optimisation : bool
+        If False, minimize infidelity only. If True, first minimize infidelity,
+        then run the entropy-constrained primal-dual loop from the same x0;
+        the baseline infidelity result is stored in results.baseline. Default: False.
 
     Entropy Constraint (Primal-Dual)
     ---------------------------------
@@ -152,7 +152,7 @@ class SimulationConfig:
     # Baseline optimization
     gtol: float = 1e-12
     maxiter: int = 200
-    run_mode: RunMode = "infidelity"
+    entanglement_optimisation: bool = False
     optimisation_target: OptimisationTarget = "state"
 
     # Entropy-constrained optimization
@@ -220,7 +220,7 @@ class SQEResults:
     history : Optional[list[dict[str, Any]]]
         Per-iteration history (entropy-constrained mode only).
     baseline : Optional[SQEResults]
-        Baseline infidelity-only result (when run_mode="both").
+        Baseline infidelity-only result (when entanglement_optimisation=True).
     """
 
     config: SimulationConfig
@@ -281,7 +281,7 @@ class SQEGateResults:
     history : Optional[list[dict[str, Any]]]
         Per-iteration history (constrained mode only).
     baseline : Optional[SQEGateResults]
-        Baseline infidelity-only result (when run_mode="both").
+        Baseline infidelity-only result (when entanglement_optimisation=True).
     """
 
     config: SimulationConfig
@@ -343,7 +343,7 @@ class DQEResults:
     history : Optional[list[dict]]
         Per-outer-iteration diagnostics (entropy-constrained mode only).
     baseline : Optional[DQEResults]
-        Infidelity-only result attached when run_mode="both".
+        Infidelity-only result attached when entanglement_optimisation=True.
     """
 
     config: SimulationConfig
@@ -364,3 +364,64 @@ class DQEResults:
     lam_final: Optional[float] = None
     history: Optional[list[dict[str, Any]]] = None
     baseline: Optional["DQEResults"] = None
+
+
+@dataclass
+class DQEGateResults:
+    """
+    Results from gate-based DQE optimization.
+
+    4-spin chain with 3 nearest-neighbor J channels.  The control parameter
+    vector x has shape (n_time_steps * 3,).
+
+    Attributes
+    ----------
+    config : SimulationConfig
+    x0 : np.ndarray
+        Initial control parameters, shape (n_time_steps * 3,).
+    x_final : np.ndarray
+        Optimized control parameters, shape (n_time_steps * 3,).
+    infid_initial : np.ndarray
+        Gate infidelity trajectory for initial parameters, shape (n_fine + 1,).
+    infid_final : np.ndarray
+        Gate infidelity trajectory for optimized parameters, shape (n_fine + 1,).
+    ent_initial : np.ndarray
+        Trajectory of config.gate_ent_measure for initial parameters,
+        shape (n_fine + 1,).
+    ent_final : np.ndarray
+        Trajectory of config.gate_ent_measure for optimized parameters,
+        shape (n_fine + 1,).
+    extra_ent_initial : dict[str, np.ndarray]
+        Trajectories for each measure in config.extra_ent_measures (initial x).
+    extra_ent_final : dict[str, np.ndarray]
+        Trajectories for each measure in config.extra_ent_measures (final x).
+    gradient_norm : float
+    n_iterations : int
+    optimization_success : bool
+    lam_final : Optional[float]
+    history : Optional[list[dict]]
+    baseline : Optional[DQEGateResults]
+        Infidelity-only result attached when entanglement_optimisation=True.
+    """
+
+    config: SimulationConfig
+
+    x0: np.ndarray
+    x_final: np.ndarray
+
+    infid_initial: np.ndarray
+    infid_final: np.ndarray
+
+    ent_initial: np.ndarray
+    ent_final: np.ndarray
+
+    extra_ent_initial: dict = field(default_factory=dict)
+    extra_ent_final: dict = field(default_factory=dict)
+
+    gradient_norm: float = 0.0
+    n_iterations: int = 0
+    optimization_success: bool = False
+
+    lam_final: Optional[float] = None
+    history: Optional[list[dict[str, Any]]] = None
+    baseline: Optional["DQEGateResults"] = None
