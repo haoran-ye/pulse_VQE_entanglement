@@ -29,47 +29,41 @@ from pulse_vqe_entanglement.sqe_gate import sqe_gate_optimisation
 # =============================================================================
 
 OUTDIR = Path(
-    "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met_sqe_gate_warmstart"
+    "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met/met_sqe_gate_warmstart"
 )
 
 N_WORKERS = 9
-
-# Henrik style: one almost-boundary init plus several random/alternative inits.
-N_INITS = 6
+N_INITS = 4
 
 ZEEMAN_SPLITTINGS = np.array([1000.0, 1008.0])
-INITIAL_STATE = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)  # dummy for gate optimiser
+INITIAL_STATE = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
 
 J_MIN = 0.0
 J_MAX = 10.0
 
-# Henrik-style near-boundary/near-zero initialisations.
 J_INIT_SCALE_SMALL = 1e-4
 J_INIT_SCALE_RANDOM = 1e-1
 J_INIT_MEAN_NEGATIVE = -1.0 + 1e-4
 J_INIT_MEAN_ZERO = 0.0
 
-# Henrik pulse segmentation: fixed number of control segments.
-N_TIME_STEPS = 100
+N_TIME_STEPS = 50
 N_DISCRETISATION = 1
 
 MAXITER = 200
 GTOL = 1e-6
 XRTOL = 1e-4
 
-# Henrik theta grid:
-# small thetas + main grid from 0.025π to 0.5π.
 MAIN_THETAS = np.arange(0.0125, 0.2501, 0.0125) * 2.0 * np.pi
-SMALL_THETAS = np.array([0.0, 0.0125 / 4.0, 0.0125 / 2.0, 0.0125 * 3.0 / 4.0]) * 2.0 * np.pi
+SMALL_THETAS = np.array(
+    [0.0, 0.0125 / 4.0, 0.0125 / 2.0, 0.0125 * 3.0 / 4.0]
+) * 2.0 * np.pi
 EXCITATION_STRENGTHS = np.concatenate([SMALL_THETAS, MAIN_THETAS])
 
-# Henrik direction: long to short. Saved arrays are still sorted increasing.
-PULSE_DURATIONS = np.arange(5.0, 1200.0, 20.0)
+PULSE_DURATIONS = np.arange(5.0, 1200.0, 30.0)
 PULSE_DURATIONS_DESC = PULSE_DURATIONS[::-1]
 
 INFIDELITY_FLOOR = 1e-13
 
-# Propagation logic, matching Henrik's idea.
 PROPAGATION_THRESHOLD_LOG10 = -4.0
 MAX_WORSE_THAN_PREVIOUS_LOG10 = 3.0
 INITIAL_PREVIOUS_LOG10 = -5.0
@@ -102,31 +96,30 @@ def supports_field(name: str) -> bool:
     return name in CONFIG_FIELDS
 
 
-def add_warm_start_if_supported(kwargs: dict, x0: np.ndarray | None) -> dict:
+def add_warm_start(kwargs: dict, x0: np.ndarray | None) -> dict:
     """
-    Your optimiser must support one of these fields for true Henrik-style warm start.
+    Requires SimulationConfig.x0_override and sqe_gate_optimisation to use it.
 
-    If none exists, the script still runs, but warm-start propagation will not actually
-    affect the next optimisation.
+    In sqe_gate.py, initialise x0 with something like:
+
+        if getattr(config, "x0_override", None) is not None:
+            x0 = np.asarray(config.x0_override, dtype=float).copy()
+        else:
+            x0 = _initialise_x0(config)
     """
     if x0 is None:
         return kwargs
 
-    candidate_fields = [
-        "x0",
-        "x_init",
-        "initial_x",
-        "initial_controls",
-        "J_init",
-        "J_initial",
-        "x0_override",
-    ]
+    if not supports_field("x0_override"):
+        raise RuntimeError(
+            "Warm start requested, but SimulationConfig has no field 'x0_override'.\n"
+            "Add this field to SimulationConfig:\n\n"
+            "    x0_override: np.ndarray | None = None\n\n"
+            "and modify sqe_gate.py so _initialise_x0 is bypassed when "
+            "config.x0_override is not None."
+        )
 
-    for name in candidate_fields:
-        if supports_field(name):
-            kwargs[name] = np.asarray(x0, dtype=float)
-            return kwargs
-
+    kwargs["x0_override"] = np.asarray(x0, dtype=float).copy()
     return kwargs
 
 
@@ -135,15 +128,6 @@ def add_warm_start_if_supported(kwargs: dict, x0: np.ndarray | None) -> dict:
 # =============================================================================
 
 def init_settings_for_index(init_index: int) -> tuple[float, float]:
-    """
-    Henrik uses one near-boundary pulse plus several random ones.
-    This version keeps your simple style:
-
-    init 0:
-        near J_min/negative internal value, tiny scale
-    remaining:
-        half near 0, half near -1+1e-4, with larger random scale
-    """
     if init_index == 0:
         return J_INIT_MEAN_NEGATIVE, J_INIT_SCALE_SMALL
 
@@ -158,18 +142,10 @@ def deterministic_seed(theta_index: int, init_index: int, duration_index: int = 
 
 
 # =============================================================================
-# Worker: one Henrik-style column
+# Worker: one warm-start column
 # =============================================================================
 
 def run_theta_init_column(job):
-    """
-    One job = one theta and one initialisation family.
-
-    Inside the job:
-    - sweep T from long to short;
-    - warm start each shorter T from previous successful longer-T pulse;
-    - reset if optimisation fails or becomes much worse.
-    """
     theta_index, init_index, theta = job
 
     J_init_mean, J_init_scale = init_settings_for_index(init_index)
@@ -182,7 +158,11 @@ def run_theta_init_column(job):
 
     for T in PULSE_DURATIONS_DESC:
         duration_index = int(np.where(PULSE_DURATIONS == T)[0][0])
-        seed = deterministic_seed(theta_index, init_index, duration_index + secondary_seed_offset)
+        seed = deterministic_seed(
+            theta_index,
+            init_index,
+            duration_index + secondary_seed_offset,
+        )
 
         kwargs = dict(
             zeeman_splittings=ZEEMAN_SPLITTINGS,
@@ -204,7 +184,7 @@ def run_theta_init_column(job):
             n_J_channels=1,
         )
 
-        kwargs = add_warm_start_if_supported(kwargs, propagated_x)
+        kwargs = add_warm_start(kwargs, propagated_x)
         config = make_config(**kwargs)
 
         result = sqe_gate_optimisation(config)
@@ -217,6 +197,11 @@ def run_theta_init_column(job):
 
         x_final = np.asarray(result.x_final, dtype=float)
         x0 = np.asarray(result.x0, dtype=float)
+
+        if propagated_x is not None:
+            warm_start_diff = float(np.linalg.norm(x0 - propagated_x))
+        else:
+            warm_start_diff = np.nan
 
         column_results.append(
             {
@@ -238,22 +223,25 @@ def run_theta_init_column(job):
                 "nit": int(result.n_iterations),
                 "grad_norm": float(result.gradient_norm),
                 "used_warm_start": propagated_x is not None,
+                "warm_start_diff": warm_start_diff,
             }
         )
 
-        # Henrik-style propagation rule.
         should_propagate = False
 
         if success:
-            if logI < loginfidelity_from_previous + MAX_WORSE_THAN_PREVIOUS_LOG10:
-                if logI < PROPAGATION_THRESHOLD_LOG10:
-                    should_propagate = True
+            not_too_much_worse = (
+                logI < loginfidelity_from_previous + MAX_WORSE_THAN_PREVIOUS_LOG10
+            )
+            below_threshold = logI < PROPAGATION_THRESHOLD_LOG10
+
+            if not_too_much_worse and below_threshold:
+                should_propagate = True
 
         if should_propagate:
             propagated_x = x_final
             loginfidelity_from_previous = logI
         else:
-            # Reset to a new random family if current chain becomes bad.
             propagated_x = None
             secondary_seed_offset += 10000000
             loginfidelity_from_previous = INITIAL_PREVIOUS_LOG10
@@ -272,7 +260,6 @@ def build_jobs():
         for i_init in range(N_INITS):
             jobs.append((i_theta, i_init, float(theta)))
 
-    # Same spirit as Henrik: shuffle columns so early progress samples broad theta range.
     rng = np.random.default_rng(44)
     rng.shuffle(jobs)
 
@@ -284,12 +271,18 @@ def build_jobs():
 # =============================================================================
 
 def apply_monotonic_duration_correction(best_infid):
+    """
+    Saved duration axis is short -> long.
+
+    If a shorter duration has lower infidelity, overwrite the longer duration
+    with the shorter-duration result, then continue comparing to the next longer.
+    """
     corrected = best_infid.copy()
 
     for i_theta in range(corrected.shape[0]):
         running_best = np.inf
 
-        for i_T in range(corrected.shape[1] - 1, -1, -1):
+        for i_T in range(corrected.shape[1]):
             if not np.isfinite(corrected[i_theta, i_T]):
                 continue
 
@@ -318,6 +311,7 @@ def save_results(raw_results):
     n_time_steps_used = np.full((n_theta, n_T, N_INITS), -1)
     segment_duration_ns = np.full((n_theta, n_T, N_INITS), np.nan)
     used_warm_start = np.full((n_theta, n_T, N_INITS), False)
+    warm_start_diff = np.full((n_theta, n_T, N_INITS), np.nan)
 
     x0_all = np.empty((n_theta, n_T, N_INITS), dtype=object)
     x_final_all = np.empty((n_theta, n_T, N_INITS), dtype=object)
@@ -338,6 +332,7 @@ def save_results(raw_results):
         n_time_steps_used[i, j, k] = r["n_time_steps"]
         segment_duration_ns[i, j, k] = r["segment_duration_ns"]
         used_warm_start[i, j, k] = r["used_warm_start"]
+        warm_start_diff[i, j, k] = r["warm_start_diff"]
         x0_all[i, j, k] = r["x0"]
         x_final_all[i, j, k] = r["x_final"]
 
@@ -372,6 +367,7 @@ def save_results(raw_results):
         n_time_steps_used=n_time_steps_used,
         segment_duration_ns=segment_duration_ns,
         used_warm_start=used_warm_start,
+        warm_start_diff=warm_start_diff,
         x0_all=x0_all,
         x_final_all=x_final_all,
         n_time_steps=N_TIME_STEPS,
@@ -402,16 +398,14 @@ def save_results(raw_results):
 def main():
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
-    warm_start_fields = [
-        "x0",
-        "x_init",
-        "initial_x",
-        "initial_controls",
-        "J_init",
-        "J_initial",
-        "x0_override",
-    ]
-    supported = [f for f in warm_start_fields if supports_field(f)]
+    if not supports_field("x0_override"):
+        raise RuntimeError(
+            "SimulationConfig does not contain x0_override, so warm-starting "
+            "cannot work. Add:\n\n"
+            "    x0_override: np.ndarray | None = None\n\n"
+            "to SimulationConfig, and modify sqe_gate.py to use it before "
+            "calling _initialise_x0(config)."
+        )
 
     print(f"Number of SQE gate warm-start columns: {len(EXCITATION_STRENGTHS) * N_INITS}")
     print(f"Each column sweeps {len(PULSE_DURATIONS)} durations from long to short.")
@@ -419,15 +413,10 @@ def main():
     print(f"Saving results to: {OUTDIR.resolve()}")
     print(f"Number of workers: {N_WORKERS}")
     print(f"Pulse segments fixed to: {N_TIME_STEPS}")
-    print(f"Duration order: long to short")
-    print(f"Warm-start-compatible SimulationConfig fields found: {supported}")
-
-    if not supported:
-        print(
-            "\nWARNING: No obvious warm-start field found in SimulationConfig.\n"
-            "The script will still run, but propagated x_final may not be used.\n"
-            "If your optimiser supports a different field name, add it to warm_start_fields.\n"
-        )
+    print("Saved duration order: short to long")
+    print("Optimisation order inside each column: long to short")
+    print("Post-processing correction: short to long")
+    print("Warm start field: x0_override")
 
     jobs = build_jobs()
 

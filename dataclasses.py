@@ -48,6 +48,8 @@ class SimulationConfig:
     J_init_seed: Optional[int] = None
     feromagnetic: bool = False
 
+    x0_override: np.ndarray | None = None
+    
     gtol: float = 1e-12
     maxiter: int = 200
     entanglement_optimisation: bool = False

@@ -27,7 +27,7 @@ from pulse_vqe_entanglement.dqe_gate import dqe_gate_optimisation
 # User settings
 # =============================================================================
 
-OUTDIR = Path("/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met_dqe_gate")
+OUTDIR = Path("/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met/met_dqe_gate")
 
 N_WORKERS = 9
 N_INITS = 4  # better to keep this even, so half mean 0 and half mean -1

@@ -114,10 +114,14 @@ def _initialise_seed(config: SimulationConfig) -> None:
         np.random.seed(int(config.J_init_seed))
 
 
+
 def _initialise_x0(config: SimulationConfig) -> np.ndarray:
     """Initial control parameters, shape (n_time_steps * 3,), clipped to [-1, 1]."""
-    n = int(config.n_time_steps) * 3
-    x0 = config.J_init_mean + float(config.J_init_scale) * np.random.uniform(-1.0, 1.0, size=n)
+    if getattr(config, "x0_override", None) is not None:
+        x0 = np.asarray(config.x0_override, dtype=float).copy()
+    else:
+        n = int(config.n_time_steps) * int(config.n_J_channels)
+        x0 = config.J_init_mean + float(config.J_init_scale) * np.random.uniform(-1.0, 1.0, size=n)
     return np.clip(x0, -1.0, 1.0).astype(np.float64, copy=False)
 
 

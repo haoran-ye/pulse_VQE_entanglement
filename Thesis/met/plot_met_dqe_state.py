@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 # User settings
 # =============================================================================
 
-RESULTS_FILE = Path("/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met_dqe_state/met_dqe_state_results.npz")
+RESULTS_FILE = Path("/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met/met_dqe_state/met_dqe_state_results.npz")
 OUTDIR = RESULTS_FILE.parent
 
 PLOT_FILENAME = "met_dqe_state_map.png"

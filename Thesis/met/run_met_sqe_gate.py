@@ -27,7 +27,7 @@ from pulse_vqe_entanglement.sqe_gate import sqe_gate_optimisation
 # User settings
 # =============================================================================
 
-OUTDIR = Path("/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met_sqe_gate")
+OUTDIR = Path("/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/results/met/met_sqe_gate")
 
 N_WORKERS = 9
 N_INITS = 4  # better to keep this even, so half mean 0 and half mean -1
@@ -49,8 +49,7 @@ MAXITER = 200
 GTOL = 1e-12
 
 EXCITATION_STRENGTHS = np.linspace(0.0, 0.5 * np.pi, 50)
-PULSE_DURATIONS = np.arange(1, 500.0 + 1e-9, 10.0)
-
+PULSE_DURATIONS = np.arange(1, 1200.0 + 1e-9, 20.0)
 INFIDELITY_FLOOR = 1e-13
 
 RESULTS_FILENAME = "met_sqe_gate_results.npz"

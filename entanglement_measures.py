@@ -233,7 +233,7 @@ def operator_entanglement(U: np.ndarray) -> float:
     return float(-np.sum(p * np.log2(p)))
 
 
-def average_entangling_power(U: np.ndarray, n_samples: int = 200,
+def average_entangling_power(U: np.ndarray, n_samples: int = 20,
                              seed: int | None = None) -> float:
     """
     MC estimate of average output entanglement over random product inputs.
@@ -247,7 +247,7 @@ def average_entangling_power(U: np.ndarray, n_samples: int = 200,
     ]))
 
 
-def max_output_entanglement(U: np.ndarray, n_trials: int = 2000,
+def max_output_entanglement(U: np.ndarray, n_trials: int = 20,
                             seed: int | None = None) -> float:
     """
     MC estimate of maximum output entanglement over random product inputs.
@@ -260,7 +260,7 @@ def max_output_entanglement(U: np.ndarray, n_trials: int = 2000,
     ))
 
 
-def assisted_entangling_power(U: np.ndarray, n_trials: int = 2000,
+def assisted_entangling_power(U: np.ndarray, n_trials: int = 5,
                               seed: int | None = None) -> float:
     """
     MC estimate of maximum entanglement gain over arbitrary pure inputs.
