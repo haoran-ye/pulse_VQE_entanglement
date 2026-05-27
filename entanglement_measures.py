@@ -246,8 +246,19 @@ def average_entangling_power(U: np.ndarray, n_samples: int = 20,
         von_neumann_entropy_single(U @ _product_state(rng)) for _ in range(n_samples)
     ]))
 
+"""
+def average_entangling_power(
+    U: np.ndarray,
+) -> float:
 
-def max_output_entanglement(U: np.ndarray, n_trials: int = 20,
+    state1 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.complex128)
+    state2 = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.complex128)
+
+    return float((von_neumann_entropy_single(U @ state1) + von_neumann_entropy_single(U @ state2)) / 2.0)
+"""
+
+
+def max_output_entanglement(U: np.ndarray, n_trials: int = 10,
                             seed: int | None = None) -> float:
     """
     MC estimate of maximum output entanglement over random product inputs.
@@ -260,7 +271,7 @@ def max_output_entanglement(U: np.ndarray, n_trials: int = 20,
     ))
 
 
-def assisted_entangling_power(U: np.ndarray, n_trials: int = 5,
+def assisted_entangling_power(U: np.ndarray, n_trials: int = 10,
                               seed: int | None = None) -> float:
     """
     MC estimate of maximum entanglement gain over arbitrary pure inputs.
