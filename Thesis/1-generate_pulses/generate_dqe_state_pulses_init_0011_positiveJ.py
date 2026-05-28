@@ -6,19 +6,11 @@ Generate a reusable DQE-state pulse database starting from |0011>.
 
 This script saves EVERY run/init and does NO selection.
 
-Output:
-    PULSES_DATABASE/dqe_state_initstate_0011_positiveJ_pulses.npz
+Important convention:
+    Pulse arrays have shape:
+        (n_theta, n_duration, n_init, N_TIME_STEPS * N_J_CHANNELS)
 
-Pulse-array convention:
-    baseline_x_final/the ent_x_final have shape
-        (n_theta, n_duration, n_init, max_n_pulse_params)
-
-    For DQE state:
-        n_J_channels = 3
-        max_n_pulse_params = MAX_N_TIME_STEPS * n_J_channels
-
-    For grid point (i_theta, i_T), the valid pulse slice is
-        : n_time_steps_used[i_theta, i_T] * n_J_channels
+All grid points use the SAME number of time steps.
 """
 
 from __future__ import annotations
@@ -51,14 +43,17 @@ PULSES_DATABASE = Path(
 
 SYSTEM_NAME = "dqe_state"
 INITIAL_STATE_LABEL = "initstate_0011"
-J_SETTINGS = "positiveJ"  # "positiveJ" or "mixedJ", remember to change J_MIN/J_MAX.
+J_SETTINGS = "positiveJ"
 
 OUTDIR = PULSES_DATABASE
 OUTDIR.mkdir(parents=True, exist_ok=True)
+
 RAW_OUT = OUTDIR / f"{SYSTEM_NAME}_{INITIAL_STATE_LABEL}_{J_SETTINGS}_pulses.npz"
 
-THETAS = np.linspace(0.0 * np.pi, 0.50 * np.pi, 20)
-DURATIONS_NS = np.arange(1.0, 1200.0, 60.0)
+small_thetas = np.linspace(0.0 * np.pi, 0.009 * np.pi, 5)
+large_thetas = np.linspace(0.01 * np.pi, 0.50 * np.pi, 30)
+THETAS = np.concatenate([small_thetas, large_thetas])
+DURATIONS_NS = np.arange(1.0, 1200.0, 40.0)
 
 N_INITS = 1
 N_WORKERS = 9
@@ -68,10 +63,9 @@ CHECKPOINT_EVERY = 100
 INFIDELITY_THRESHOLD = 1e-5
 INFIDELITY_FLOOR = 1e-14
 
-MAX_N_TIME_STEPS = 50
-MIN_SEGMENT_DURATION_NS = 1.0
+N_TIME_STEPS = 50
 N_J_CHANNELS = 3
-MAX_N_PULSE_PARAMS = MAX_N_TIME_STEPS * N_J_CHANNELS
+N_PULSE_PARAMS = N_TIME_STEPS * N_J_CHANNELS
 
 N_OUTER = 3
 INNER_MAXITER = 200
@@ -80,7 +74,7 @@ DUAL_LR = 1e10
 RHO = 0.0
 FD_EPS = 1e-6
 
-ENTANGLEMENT_CAP = 0.1
+ENTANGLEMENT_CAP = 0.01
 
 J_INIT_MEANS = np.array(
     [0.0] * (N_INITS // 2)
@@ -95,7 +89,7 @@ BASE_CONFIG_KWARGS: dict[str, Any] = dict(
     zeeman_splittings=ZEEMAN,
     initial_state=INITIAL_STATE,
     theta_target=0.0,
-    n_time_steps=50,
+    n_time_steps=N_TIME_STEPS,
     n_discretisation=1,
     T=200.0,
     max_drive_strength=0.0,
@@ -170,13 +164,6 @@ def fixed_width_x(x: Any, width: int) -> np.ndarray:
     return out
 
 
-def n_time_steps_for_duration(T_ns: float) -> int:
-    return max(
-        1,
-        min(MAX_N_TIME_STEPS, int(np.floor(T_ns / MIN_SEGMENT_DURATION_NS))),
-    )
-
-
 def average_entropy(entropies: np.ndarray) -> float:
     entropies = as_1d_float_array(entropies)
     if entropies.size == 0 or np.all(~np.isfinite(entropies)):
@@ -247,12 +234,10 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
         base_config,
     ) = task
 
-    n_steps = n_time_steps_for_duration(T_ns)
-
     common_kwargs = dict(
         theta_target=float(theta),
         T=float(T_ns),
-        n_time_steps=int(n_steps),
+        n_time_steps=int(N_TIME_STEPS),
         J_init_seed=int(seed),
         J_init_mean=float(j_init_mean),
         S_max=float(ENTANGLEMENT_CAP),
@@ -290,16 +275,16 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
         k_init=k_init,
         seed=seed,
         J_init_mean=j_init_mean,
-        n_time_steps=n_steps,
-        segment_duration_ns=T_ns / n_steps,
+        n_time_steps=N_TIME_STEPS,
+        segment_duration_ns=T_ns / N_TIME_STEPS,
 
         baseline_success=np.isfinite(baseline_final_infid) and baseline_final_infid <= INFIDELITY_THRESHOLD,
         baseline_optimization_success=baseline_arrays["optimization_success"],
         baseline_final_infid=baseline_final_infid,
         baseline_s_avg=average_entropy(baseline_arrays["entropies"]),
         baseline_s_max=max_entropy(baseline_arrays["entropies"]),
-        baseline_x0=fixed_width_x(baseline_arrays["x0"], MAX_N_PULSE_PARAMS),
-        baseline_x_final=fixed_width_x(baseline_arrays["x_final"], MAX_N_PULSE_PARAMS),
+        baseline_x0=fixed_width_x(baseline_arrays["x0"], N_PULSE_PARAMS),
+        baseline_x_final=fixed_width_x(baseline_arrays["x_final"], N_PULSE_PARAMS),
         baseline_n_iterations=baseline_arrays["n_iterations"],
         baseline_gradient_norm=baseline_arrays["gradient_norm"],
 
@@ -308,8 +293,8 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
         ent_final_infid=ent_final_infid,
         ent_s_avg=average_entropy(ent_arrays["entropies"]),
         ent_s_max=max_entropy(ent_arrays["entropies"]),
-        ent_x0=fixed_width_x(ent_arrays["x0"], MAX_N_PULSE_PARAMS),
-        ent_x_final=fixed_width_x(ent_arrays["x_final"], MAX_N_PULSE_PARAMS),
+        ent_x0=fixed_width_x(ent_arrays["x0"], N_PULSE_PARAMS),
+        ent_x_final=fixed_width_x(ent_arrays["x_final"], N_PULSE_PARAMS),
         ent_n_iterations=ent_arrays["n_iterations"],
         ent_gradient_norm=ent_arrays["gradient_norm"],
     )
@@ -338,10 +323,10 @@ def initialise_arrays() -> dict[str, Any]:
         baseline_s_max=np.full(shape, np.nan),
         ent_s_max=np.full(shape, np.nan),
 
-        baseline_x0=np.full(shape + (MAX_N_PULSE_PARAMS,), np.nan),
-        ent_x0=np.full(shape + (MAX_N_PULSE_PARAMS,), np.nan),
-        baseline_x_final=np.full(shape + (MAX_N_PULSE_PARAMS,), np.nan),
-        ent_x_final=np.full(shape + (MAX_N_PULSE_PARAMS,), np.nan),
+        baseline_x0=np.full(shape + (N_PULSE_PARAMS,), np.nan),
+        ent_x0=np.full(shape + (N_PULSE_PARAMS,), np.nan),
+        baseline_x_final=np.full(shape + (N_PULSE_PARAMS,), np.nan),
+        ent_x_final=np.full(shape + (N_PULSE_PARAMS,), np.nan),
 
         baseline_n_iterations=np.full(shape, np.nan),
         ent_n_iterations=np.full(shape, np.nan),
@@ -351,7 +336,7 @@ def initialise_arrays() -> dict[str, Any]:
         seeds=np.full(shape, -1, dtype=np.int64),
         J_init_means=np.full(shape, np.nan),
 
-        n_time_steps_used=np.full((n_theta, n_T), -1, dtype=int),
+        n_time_steps_used=np.full((n_theta, n_T), N_TIME_STEPS, dtype=int),
         segment_duration_ns=np.full((n_theta, n_T), np.nan),
     )
 
@@ -388,9 +373,9 @@ def save_raw(arrays: dict[str, Any]) -> None:
         n_outer=N_OUTER,
         inner_maxiter=INNER_MAXITER,
         fd_eps=FD_EPS,
-        max_n_time_steps=MAX_N_TIME_STEPS,
-        max_n_pulse_params=MAX_N_PULSE_PARAMS,
-        min_segment_duration_ns=MIN_SEGMENT_DURATION_NS,
+        n_time_steps=N_TIME_STEPS,
+        max_n_time_steps=N_TIME_STEPS,
+        n_pulse_params=N_PULSE_PARAMS,
         n_workers=N_WORKERS,
 
         **arrays,
@@ -428,6 +413,9 @@ def update_arrays(arrays: dict[str, Any], out: dict[str, Any]) -> None:
     arrays["seeds"][i, j, k] = out["seed"]
     arrays["J_init_means"][i, j, k] = out["J_init_mean"]
 
+    arrays["n_time_steps_used"][i, j] = out["n_time_steps"]
+    arrays["segment_duration_ns"][i, j] = out["segment_duration_ns"]
+
 
 # ============================================================
 # Main
@@ -442,9 +430,8 @@ def main() -> None:
 
     for i, theta in enumerate(THETAS):
         for j, T_ns in enumerate(DURATIONS_NS):
-            n_steps = n_time_steps_for_duration(float(T_ns))
-            arrays["n_time_steps_used"][i, j] = n_steps
-            arrays["segment_duration_ns"][i, j] = float(T_ns) / n_steps
+            arrays["n_time_steps_used"][i, j] = N_TIME_STEPS
+            arrays["segment_duration_ns"][i, j] = float(T_ns) / N_TIME_STEPS
 
             seed_list = rng.integers(0, 2**31 - 1, size=N_INITS, dtype=np.int64)
 
@@ -471,6 +458,8 @@ def main() -> None:
     print(f"N durations = {len(DURATIONS_NS)}")
     print(f"N inits per point = {N_INITS}")
     print(f"N J channels = {N_J_CHANNELS}")
+    print(f"N time steps = {N_TIME_STEPS}")
+    print(f"N pulse params = {N_PULSE_PARAMS}")
     print(f"Total seed jobs = {len(tasks)}")
     print("=" * 72)
 

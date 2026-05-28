@@ -1,47 +1,6 @@
 #!/usr/bin/env python3
 """
 plot_pulse_database_met_ent.py
-
-Plot MET-entanglement maps from a raw pulse database.
-
-This version uses the raw PULSES_DATABASE format, but applies the intended
-TEM-after selection logic:
-
-Before / baseline:
-    At each fixed (theta, T), choose the baseline init with lowest infidelity.
-
-After / TEM:
-    For each fixed theta, scan durations in increasing T.
-
-    At each T:
-      1. Locally select the lowest-entanglement successful TEM init
-         among runs satisfying infidelity <= threshold.
-      2. If no successful TEM init exists at this T, locally select the
-         lowest-infidelity TEM init only as a fallback for pre-MET plotting.
-      3. Maintain the best successful TEM pulse found so far along increasing T,
-         ranked by lowest entanglement.
-      4. Once a successful TEM pulse has been found, use the lowest-entanglement
-         successful pulse so far for all later durations.
-
-Therefore:
-    - before has no duration overriding;
-    - after/TEM has entanglement-based duration overriding after MET;
-    - after_infid and after_ent always correspond to the same selected run;
-    - no selected .npz file is saved.
-
-Expected raw database arrays:
-    thetas
-    durations_ns
-    baseline_final_infids
-    ent_final_infids
-
-For state database:
-    baseline_s_avg / baseline_s_max
-    ent_s_avg / ent_s_max
-
-For gate database:
-    baseline_ent_avg / baseline_ent_max
-    ent_ent_avg / ent_ent_max
 """
 
 from pathlib import Path
@@ -55,19 +14,15 @@ import matplotlib.pyplot as plt
 
 INPUT_FILE = Path(
     "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE/"
-    "sqe_gate_mixedJ_pulses.npz"
+    "dqe_gate_positiveJ_rowprop_pulses.npz"
 )
 
-# Output goes to the same directory as this plotting script.
 OUTDIR = Path(__file__).resolve().parent
-
 PLOT_PREFIX = INPUT_FILE.stem
 
 INFIDELITY_FLOOR = 1e-14
 MET_THRESHOLD = 1e-5
 
-# Choose "avg" for the current met_ent story.
-# Choose "max" only if you explicitly want max-entanglement plots.
 ENTANGLEMENT_STAT = "avg"
 # ENTANGLEMENT_STAT = "max"
 
@@ -89,6 +44,49 @@ def add_colorbar(fig, ax, im, label):
     return cbar
 
 
+def add_shared_colorbar(fig, axes, im, label):
+    cbar = fig.colorbar(
+        im,
+        ax=axes,
+        pad=0.02,
+        fraction=0.046,
+        shrink=1.0,
+        aspect=25,
+    )
+
+    # This is the version that keeps the left/middle colourbar correct.
+    pos0 = axes[0].get_position()
+
+    cbar.ax.set_position([
+        cbar.ax.get_position().x0,
+        pos0.y0,
+        cbar.ax.get_position().width,
+        pos0.y1 - pos0.y0,
+    ])
+
+    cbar.set_label(label)
+    return cbar
+
+
+def match_colorbar_height_to_axis(cbar, ax):
+    """
+    Force a single-panel colourbar to have exactly the same vertical extent
+    as its corresponding heatmap axis.
+
+    This only modifies the right/reduction colourbar and leaves the existing
+    shared left/middle colourbar behaviour unchanged.
+    """
+    pos = ax.get_position()
+    cbar_pos = cbar.ax.get_position()
+
+    cbar.ax.set_position([
+        cbar_pos.x0,
+        pos.y0,
+        cbar_pos.width,
+        pos.y1 - pos.y0,
+    ])
+
+
 def get_array(raw, *names):
     for name in names:
         if name in raw.files:
@@ -101,7 +99,7 @@ def infer_database_kind(raw):
         return "state"
     if "ent_ent_avg" in raw.files or "ent_ent_max" in raw.files:
         return "gate"
-    raise KeyError("Could not infer database kind: no recognised entanglement arrays found.")
+    raise KeyError("Could not infer database kind.")
 
 
 def get_entanglement_arrays(raw, kind):
@@ -109,88 +107,70 @@ def get_entanglement_arrays(raw, kind):
         if ENTANGLEMENT_STAT == "avg":
             before_ent_all = get_array(raw, "baseline_s_avg", "baseline_s_max")
             after_ent_all = get_array(raw, "ent_s_avg", "ent_s_max")
-            before_cbar = r"$\overline{S}_{\rm before}$"
-            after_cbar = r"$\overline{S}_{\rm after}$"
-            reduction_cbar = r"$\overline{S}_{\rm before}-\overline{S}_{\rm after}$"
-            reduction_title = "Average entanglement reduction"
+            reduction_title = "Reduction in state entanglement"
         elif ENTANGLEMENT_STAT == "max":
             before_ent_all = get_array(raw, "baseline_s_max", "baseline_s_avg")
             after_ent_all = get_array(raw, "ent_s_max", "ent_s_avg")
-            before_cbar = r"$S_{\max,\rm before}$"
-            after_cbar = r"$S_{\max,\rm after}$"
-            reduction_cbar = r"$S_{\max,\rm before}-S_{\max,\rm after}$"
-            reduction_title = "Maximum entanglement reduction"
+            reduction_title = "Maximum reduction in state entanglement"
         else:
             raise ValueError("ENTANGLEMENT_STAT must be 'avg' or 'max'.")
 
-        return before_ent_all, after_ent_all, before_cbar, after_cbar, reduction_cbar, reduction_title
-
-    if kind == "gate":
+    elif kind == "gate":
         if ENTANGLEMENT_STAT == "avg":
             before_ent_all = get_array(raw, "baseline_ent_avg", "baseline_ent_max")
             after_ent_all = get_array(raw, "ent_ent_avg", "ent_ent_max")
-            before_cbar = r"$\overline{E}_{\rm op,before}$"
-            after_cbar = r"$\overline{E}_{\rm op,after}$"
-            reduction_cbar = r"$\overline{E}_{\rm op,before}-\overline{E}_{\rm op,after}$"
-            reduction_title = "Average gate-entanglement reduction"
+            reduction_title = "Reduction in unitary entanglement"
         elif ENTANGLEMENT_STAT == "max":
             before_ent_all = get_array(raw, "baseline_ent_max", "baseline_ent_avg")
             after_ent_all = get_array(raw, "ent_ent_max", "ent_ent_avg")
-            before_cbar = r"$E_{\rm op,max,before}$"
-            after_cbar = r"$E_{\rm op,max,after}$"
-            reduction_cbar = r"$E_{\rm op,max,before}-E_{\rm op,max,after}$"
-            reduction_title = "Maximum gate-entanglement reduction"
+            reduction_title = "Maximum reduction in unitary entanglement"
         else:
             raise ValueError("ENTANGLEMENT_STAT must be 'avg' or 'max'.")
 
-        return before_ent_all, after_ent_all, before_cbar, after_cbar, reduction_cbar, reduction_title
+    else:
+        raise ValueError(kind)
 
-    raise ValueError(kind)
+    shared_cbar = r"$\overline{S}_{\rm transient}$"
+
+    reduction_cbar = (
+        r"$\overline{S}_{\rm transient}"
+        r"-\overline{S}^{\rm TEM}_{\rm transient}$"
+    )
+
+    return (
+        before_ent_all,
+        after_ent_all,
+        shared_cbar,
+        reduction_cbar,
+        reduction_title,
+    )
 
 
 def select_before_from_raw(raw, before_ent_all):
-    """
-    Before / baseline:
-        At each (theta, T), choose the baseline init with lowest infidelity.
-
-    No duration overriding is applied to before.
-    """
     baseline_final_infids = raw["baseline_final_infids"]
 
     n_theta, n_T, _ = baseline_final_infids.shape
 
     before_infid = np.full((n_theta, n_T), np.nan)
     before_ent = np.full((n_theta, n_T), np.nan)
-    before_seed_index = np.full((n_theta, n_T), -1, dtype=int)
 
     for i in range(n_theta):
         for j in range(n_T):
             finite = np.isfinite(baseline_final_infids[i, j])
+
             if not np.any(finite):
                 continue
 
             idx = np.where(finite)[0]
             k = idx[np.nanargmin(baseline_final_infids[i, j, finite])]
 
-            before_seed_index[i, j] = k
             before_infid[i, j] = baseline_final_infids[i, j, k]
             before_ent[i, j] = before_ent_all[i, j, k]
 
-    return np.maximum(before_infid, INFIDELITY_FLOOR), before_ent, before_seed_index
+    return np.maximum(before_infid, INFIDELITY_FLOOR), before_ent
 
 
 def local_tem_selection_at_point(ent_infids, ent_values, threshold):
-    """
-    Local TEM selection at one fixed (theta, T).
-
-    Returns:
-        k_local
-        local_is_successful
-
-    Rule:
-        - If any successful TEM init exists, choose lowest entanglement among them.
-        - Otherwise choose lowest infidelity among finite runs.
-    """
     finite = np.isfinite(ent_infids) & np.isfinite(ent_values)
     successful = finite & (ent_infids <= threshold)
 
@@ -210,38 +190,25 @@ def local_tem_selection_at_point(ent_infids, ent_values, threshold):
 
 
 def select_after_from_raw(raw, after_ent_all, threshold):
-    """
-    After / TEM:
-
-    For each theta, scan durations in increasing T.
-
-    Before the first successful TEM run:
-        plot the local lowest-infidelity TEM run, so every finite point is visible.
-
-    Once successful TEM runs exist:
-        keep the lowest-entanglement successful TEM run found so far and use it
-        for this and all later durations, unless a later successful run gives
-        even lower entanglement.
-
-    This is the duration-overriding logic requested for TEM.
-    """
     ent_final_infids = raw["ent_final_infids"]
 
     n_theta, n_T, _ = ent_final_infids.shape
 
     after_infid = np.full((n_theta, n_T), np.nan)
     after_ent = np.full((n_theta, n_T), np.nan)
-    after_seed_index = np.full((n_theta, n_T), -1, dtype=int)
-    after_source_T_index = np.full((n_theta, n_T), -1, dtype=int)
-    after_uses_successful_override = np.full((n_theta, n_T), False, dtype=bool)
+
+    after_uses_successful_override = np.full(
+        (n_theta, n_T),
+        False,
+        dtype=bool,
+    )
 
     for i in range(n_theta):
-        best_success_k = -1
-        best_success_T_index = -1
         best_success_ent = np.inf
         best_success_infid = np.nan
 
         for j in range(n_T):
+
             k_local, local_success = local_tem_selection_at_point(
                 ent_final_infids[i, j],
                 after_ent_all[i, j],
@@ -253,34 +220,21 @@ def select_after_from_raw(raw, after_ent_all, threshold):
                 local_infid = ent_final_infids[i, j, k_local]
 
                 if local_ent < best_success_ent:
-                    best_success_k = k_local
-                    best_success_T_index = j
                     best_success_ent = local_ent
                     best_success_infid = local_infid
 
-            if best_success_k >= 0:
-                # Duration override: use the lowest-entanglement successful
-                # TEM pulse found so far along increasing T.
-                after_seed_index[i, j] = best_success_k
-                after_source_T_index[i, j] = best_success_T_index
+            if np.isfinite(best_success_ent):
                 after_infid[i, j] = best_success_infid
                 after_ent[i, j] = best_success_ent
                 after_uses_successful_override[i, j] = True
 
             elif k_local >= 0:
-                # Pre-MET fallback: no successful TEM pulse has appeared yet.
-                # Plot the local best-infidelity TEM run so the point is visible.
-                after_seed_index[i, j] = k_local
-                after_source_T_index[i, j] = j
                 after_infid[i, j] = ent_final_infids[i, j, k_local]
                 after_ent[i, j] = after_ent_all[i, j, k_local]
-                after_uses_successful_override[i, j] = False
 
     return (
         np.maximum(after_infid, INFIDELITY_FLOOR),
         after_ent,
-        after_seed_index,
-        after_source_T_index,
         after_uses_successful_override,
     )
 
@@ -290,6 +244,7 @@ def extract_met_line(infid, durations_ns, threshold):
 
     for i in range(infid.shape[0]):
         valid = np.isfinite(infid[i]) & (infid[i] <= threshold)
+
         if np.any(valid):
             met[i] = durations_ns[np.argmax(valid)]
 
@@ -298,6 +253,7 @@ def extract_met_line(infid, durations_ns, threshold):
 
 def plot_met_line(ax, theta_pi, met, label, color, linestyle="--"):
     valid = np.isfinite(met)
+
     if np.any(valid):
         ax.plot(
             theta_pi[valid],
@@ -311,30 +267,55 @@ def plot_met_line(ax, theta_pi, met, label, color, linestyle="--"):
 
 def finite_minmax(*arrays):
     values = []
+
     for arr in arrays:
         arr = np.asarray(arr, dtype=float)
+
         if np.any(np.isfinite(arr)):
             values.append(np.nanmin(arr))
             values.append(np.nanmax(arr))
+
     if not values:
         return None, None
+
     return min(values), max(values)
 
 
 def symmetric_absmax(arr):
     arr = np.asarray(arr, dtype=float)
+
     if not np.any(np.isfinite(arr)):
         return 1.0
+
     val = np.nanmax(np.abs(arr))
+
     if not np.isfinite(val) or val == 0:
         return 1.0
+
     return float(val)
 
 
-def plot_three_panel(X, Y, theta_pi, panels, outfile):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
+def plot_three_panel(
+    X,
+    Y,
+    theta_pi,
+    panels,
+    outfile,
+    shared_left_middle_cbar=False,
+):
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(15, 4.8),
+        constrained_layout=False,
+        sharey=True,
+    )
 
-    for ax, panel in zip(axes, panels):
+    images = []
+    right_cbar = None
+
+    for i_ax, (ax, panel) in enumerate(zip(axes, panels)):
+
         im = ax.pcolormesh(
             X,
             Y,
@@ -345,25 +326,73 @@ def plot_three_panel(X, Y, theta_pi, panels, outfile):
             vmax=panel.get("vmax"),
         )
 
-        add_colorbar(fig, ax, im, panel["cbar"])
+        images.append(im)
+
+        if not shared_left_middle_cbar:
+            cbar = add_colorbar(fig, ax, im, panel["cbar"])
+            match_colorbar_height_to_axis(cbar, ax)
+
+        elif i_ax == 2:
+            right_cbar = add_colorbar(fig, ax, im, panel["cbar"])
 
         if panel.get("before_met") is not None:
-            plot_met_line(ax, theta_pi, panel["before_met"], "Before MET", "white")
+            plot_met_line(
+                ax,
+                theta_pi,
+                panel["before_met"],
+                "MET (baseline)",
+                "white",
+            )
 
         if panel.get("after_met") is not None:
-            plot_met_line(ax, theta_pi, panel["after_met"], "After MET", "cyan")
+            plot_met_line(
+                ax,
+                theta_pi,
+                panel["after_met"],
+                "MET (TEM)",
+                "cyan",
+            )
 
         ax.set_title(panel["title"])
         ax.set_xlabel(r"Excitation strength $\theta/\pi$")
-        ax.set_ylabel(r"Pulse duration $T$ / ns")
         ax.grid(True, alpha=0.25, linestyle="--")
         ax.set_box_aspect(1)
 
-        if panel.get("before_met") is not None or panel.get("after_met") is not None:
+        if (
+            panel.get("before_met") is not None
+            or panel.get("after_met") is not None
+        ):
             ax.legend(frameon=True)
+
+    axes[0].set_ylabel(r"Pulse duration $T$ / ns")
+
+    if shared_left_middle_cbar:
+        shared_cbar = add_shared_colorbar(
+            fig,
+            axes[:2],
+            images[1],
+            panels[0]["cbar"],
+        )
+
+        # Do NOT modify shared_cbar; this preserves the previous correct
+        # left/middle colourbar behaviour.
+
+        if right_cbar is not None:
+            # Match the right/reduction colourbar height to the already-correct
+            # shared left/middle colourbar, not by recomputing layout.
+            shared_pos = shared_cbar.ax.get_position()
+            right_pos = right_cbar.ax.get_position()
+
+            right_cbar.ax.set_position([
+                right_pos.x0,
+                shared_pos.y0,
+                right_pos.width,
+                shared_pos.height,
+            ])
 
     fig.savefig(outfile, dpi=300, bbox_inches="tight")
     plt.close(fig)
+
     print(f"Saved plot to\n{outfile}")
 
 
@@ -372,6 +401,7 @@ def plot_three_panel(X, Y, theta_pi, panels, outfile):
 # =============================================================================
 
 def main():
+
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
     raw = np.load(INPUT_FILE, allow_pickle=True)
@@ -380,6 +410,7 @@ def main():
 
     thetas = get_array(raw, "thetas", "excitation_strengths")
     theta_pi = thetas / np.pi
+
     durations_ns = get_array(raw, "durations_ns", "pulse_durations")
 
     if "infidelity_threshold" in raw.files:
@@ -392,13 +423,12 @@ def main():
     (
         before_ent_all,
         after_ent_all,
-        before_ent_cbar,
-        after_ent_cbar,
+        shared_ent_cbar,
         reduction_ent_cbar,
         reduction_ent_title,
     ) = get_entanglement_arrays(raw, kind)
 
-    before_infid, before_ent, before_seed_index = select_before_from_raw(
+    before_infid, before_ent = select_before_from_raw(
         raw,
         before_ent_all,
     )
@@ -406,8 +436,6 @@ def main():
     (
         after_infid,
         after_ent,
-        after_seed_index,
-        after_source_T_index,
         after_uses_successful_override,
     ) = select_after_from_raw(
         raw,
@@ -415,14 +443,28 @@ def main():
         threshold,
     )
 
-    before_met = extract_met_line(before_infid, durations_ns, threshold)
-    after_met = extract_met_line(after_infid, durations_ns, threshold)
+    before_met = extract_met_line(
+        before_infid,
+        durations_ns,
+        threshold,
+    )
+
+    after_met = extract_met_line(
+        after_infid,
+        durations_ns,
+        threshold,
+    )
 
     log_before_infid = np.log10(before_infid)
     log_after_infid = np.log10(after_infid)
+
     delta_log_infid = log_after_infid - log_before_infid
 
-    infid_vmin, infid_vmax = finite_minmax(log_before_infid, log_after_infid)
+    infid_vmin, infid_vmax = finite_minmax(
+        log_before_infid,
+        log_after_infid,
+    )
+
     delta_abs = symmetric_absmax(delta_log_infid)
 
     plot_three_panel(
@@ -432,7 +474,7 @@ def main():
         panels=[
             dict(
                 z=log_before_infid,
-                title="Before entanglement optimisation",
+                title="Baseline",
                 cbar=r"$\log_{10}(\mathcal{I}_{\rm before})$",
                 cmap="inferno",
                 vmin=infid_vmin,
@@ -441,7 +483,7 @@ def main():
             ),
             dict(
                 z=log_after_infid,
-                title="After entanglement optimisation",
+                title="TEM",
                 cbar=r"$\log_{10}(\mathcal{I}_{\rm after})$",
                 cmap="inferno",
                 vmin=infid_vmin,
@@ -460,12 +502,32 @@ def main():
             ),
         ],
         outfile=OUTDIR / f"{PLOT_PREFIX}_ent_infidelity_three_panel_met.png",
+        shared_left_middle_cbar=False,
     )
+
+    # ============================================================
+    # Normalise entanglement to max value = 1
+    # ============================================================
+
+    ent_norm = np.nanmax([
+        np.nanmax(before_ent),
+        np.nanmax(after_ent),
+    ])
+
+    if not np.isfinite(ent_norm) or ent_norm == 0.0:
+        ent_norm = 1.0
+
+    before_ent = before_ent / ent_norm
+    after_ent = after_ent / ent_norm
 
     reduction_ent = before_ent - after_ent
 
-    ent_vmin, ent_vmax = finite_minmax(before_ent, after_ent)
-    red_abs = symmetric_absmax(reduction_ent)
+    ent_vmin, ent_vmax = finite_minmax(
+        before_ent,
+        after_ent,
+    )
+
+    red_abs = 1.0
 
     plot_three_panel(
         X,
@@ -474,8 +536,8 @@ def main():
         panels=[
             dict(
                 z=before_ent,
-                title="Before entanglement optimisation",
-                cbar=before_ent_cbar,
+                title="Baseline",
+                cbar=r"$\overline{S}_{\rm transient}$",
                 cmap="viridis",
                 vmin=ent_vmin,
                 vmax=ent_vmax,
@@ -483,8 +545,8 @@ def main():
             ),
             dict(
                 z=after_ent,
-                title="After entanglement optimisation",
-                cbar=after_ent_cbar,
+                title="TEM",
+                cbar=r"$\overline{S}_{\rm transient}$",
                 cmap="viridis",
                 vmin=ent_vmin,
                 vmax=ent_vmax,
@@ -493,7 +555,10 @@ def main():
             dict(
                 z=reduction_ent,
                 title=reduction_ent_title,
-                cbar=reduction_ent_cbar,
+                cbar=(
+                    r"$\overline{S}_{\rm transient}"
+                    r"-\overline{S}^{\rm TEM}_{\rm transient}$"
+                ),
                 cmap="coolwarm",
                 vmin=-red_abs,
                 vmax=red_abs,
@@ -502,6 +567,7 @@ def main():
             ),
         ],
         outfile=OUTDIR / f"{PLOT_PREFIX}_entanglement_three_panel_met.png",
+        shared_left_middle_cbar=True,
     )
 
     print()
@@ -514,6 +580,7 @@ def main():
     print(f"ENTANGLEMENT_STAT: {ENTANGLEMENT_STAT}")
     print(f"Best before infidelity: {np.nanmin(before_infid):.6e}")
     print(f"Best after infidelity:  {np.nanmin(after_infid):.6e}")
+    print(f"Entanglement normalisation: {ent_norm:.6e}")
     print(f"Max ent reduction:      {np.nanmax(reduction_ent):.6e}")
     print(f"After override points:  {np.sum(after_uses_successful_override)}")
     print("=" * 72)

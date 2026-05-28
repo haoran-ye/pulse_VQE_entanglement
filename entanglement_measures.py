@@ -156,7 +156,7 @@ def entropy_bipartite_single(state: np.ndarray, *,
 def entropy_bipartite_traj(traj: np.ndarray, *,
                             subsystem=(0, 1), n_qubits=4) -> np.ndarray:
     """
-    Von Neumann entropy S(A) along a state trajectory.
+    Von Neumann entropy S(A) along a state trajectory (vectorised).
 
     Parameters
     ----------
@@ -168,11 +168,27 @@ def entropy_bipartite_traj(traj: np.ndarray, *,
     -------
     ndarray, shape (n_t,)
     """
-    traj = np.asarray(traj)
-    return np.array([
-        entropy_bipartite_single(traj[:, t], subsystem=subsystem, n_qubits=n_qubits)
-        for t in range(traj.shape[1])
-    ])
+    traj  = np.asarray(traj, dtype=np.complex128)          # (2^n, n_t)
+    n_t   = traj.shape[1]
+    A     = tuple(subsystem)
+    B     = tuple(q for q in range(n_qubits) if q not in A)
+    dim_A = 2 ** len(A)
+    dim_B = 2 ** len(B)
+
+    # Reshape to (n_t, 2, 2, ..., 2), one axis per qubit after the batch axis
+    psi = traj.T.reshape((n_t,) + (2,) * n_qubits)
+
+    # Permute so subsystem A qubits come first, then B
+    psi = np.transpose(psi, (0,) + tuple(a + 1 for a in A) + tuple(b + 1 for b in B))
+
+    # Flatten into (n_t, dim_A, dim_B)
+    psi = psi.reshape(n_t, dim_A, dim_B)
+
+    # Batch reduced density matrix rho_A = psi @ psi†, shape (n_t, dim_A, dim_A)
+    rho_A = psi @ np.conj(psi).transpose(0, 2, 1)
+
+    eig = np.clip(np.linalg.eigvalsh(rho_A), 1e-15, 1.0)   # (n_t, dim_A)
+    return -np.sum(eig * np.log2(eig), axis=1)              # (n_t,)
 
 
 # All distinct bipartite partitions of 4 qubits
@@ -245,17 +261,6 @@ def average_entangling_power(U: np.ndarray, n_samples: int = 20,
     return float(np.mean([
         von_neumann_entropy_single(U @ _product_state(rng)) for _ in range(n_samples)
     ]))
-
-"""
-def average_entangling_power(
-    U: np.ndarray,
-) -> float:
-
-    state1 = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.complex128)
-    state2 = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.complex128)
-
-    return float((von_neumann_entropy_single(U @ state1) + von_neumann_entropy_single(U @ state2)) / 2.0)
-"""
 
 
 def max_output_entanglement(U: np.ndarray, n_trials: int = 10,

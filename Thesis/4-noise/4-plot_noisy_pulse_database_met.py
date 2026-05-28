@@ -1,31 +1,6 @@
 #!/usr/bin/env python3
 """
 plot_noisy_pulse_database_met.py
-
-Generic noisy-MET plotting script for raw pulse databases.
-
-Works for:
-    - sqe_state
-    - sqe_gate
-    - dqe_state
-    - dqe_gate
-
-This script:
-    1. Loads a raw pulse database.
-    2. Selects pulses locally at each (theta, T):
-         baseline: lowest clean infidelity at that exact grid point.
-         TEM: lowest entanglement among successful clean runs at that exact grid point;
-              if no successful TEM run exists, lowest clean infidelity at that grid point.
-    3. Evolves the selected pulse under one fixed T1/T2 Lindblad noise model.
-    4. Plots:
-         - baseline noisy infidelity map
-         - TEM noisy infidelity map
-         - improvement ratio map
-    5. Saves figures only.
-
-No duration overriding.
-No output .npz.
-No re-optimisation.
 """
 
 from __future__ import annotations
@@ -59,10 +34,9 @@ from pulse_vqe_entanglement.dqe_state import dqe_unitary, basis_state
 
 INPUT_FILE = Path(
     "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE/"
-    "sqe_gate_mixedJ_pulses.npz"
+    "dqe_gate_positiveJ_rowprop_pulses.npz"
 )
 
-# Output goes to the same directory as this plotting script.
 OUTDIR = Path(__file__).resolve().parent
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -78,9 +52,6 @@ INFID_FLOOR = 1e-16
 CLEAN_INF_THRESHOLD = 1e-5
 MET_THRESHOLD = 1e-5
 
-# Entanglement metric used for TEM local selection.
-# "avg" matches your met_ent average-entanglement story.
-# "max" can be used if needed.
 ENTANGLEMENT_STAT = "avg"
 # ENTANGLEMENT_STAT = "max"
 
@@ -96,7 +67,6 @@ X = np.array([[0, 1], [1, 0]], dtype=np.complex128)
 Y = np.array([[0, -1j], [1j, 0]], dtype=np.complex128)
 Z = np.array([[1, 0], [0, -1]], dtype=np.complex128)
 
-# Same convention as your previous noisy scripts.
 SIGMA_MINUS = np.array([[0, 1], [0, 0]], dtype=np.complex128)
 
 
@@ -204,7 +174,6 @@ def infer_initial_state(data, excitation, target_kind, n_spins):
 
         raise KeyError("State target requires initial_state in database.")
 
-    # Dummy initial state for channel evolution.
     dim = 2 ** n_spins
     psi = np.zeros(dim, dtype=np.complex128)
     psi[0] = 1.0
@@ -240,10 +209,6 @@ def get_entanglement_array(data, label, target_kind):
 # =============================================================================
 
 def select_baseline_local(data):
-    """
-    Baseline selection at each exact (theta, T):
-        choose lowest clean infidelity among all baseline inits.
-    """
     infids = get_array(data, "baseline_final_infids")
 
     n_theta, n_T, _ = infids.shape
@@ -262,15 +227,6 @@ def select_baseline_local(data):
 
 
 def select_ent_local(data, target_kind, threshold):
-    """
-    TEM selection at each exact (theta, T):
-        if any successful clean TEM run exists:
-            choose lowest-entanglement successful run.
-        otherwise:
-            choose lowest clean infidelity run.
-
-    No duration overriding.
-    """
     infids = get_array(data, "ent_final_infids")
     ent_values = get_entanglement_array(data, "ent", target_kind)
 
@@ -369,11 +325,6 @@ def lindblad_ops_T1_T2(n_spins, T1_us, T2_us):
 
 
 def drive_frequencies_for_pulse_form(excitation, zeeman):
-    """
-    Matches your previous noisy scripts:
-        SQE: pass ZEEMAN.
-        DQE: pass zeros.
-    """
     if excitation == "sqe":
         return np.asarray(zeeman, dtype=np.float64)
     if excitation == "dqe":
@@ -440,13 +391,6 @@ def state_infidelity(rho, rho_target):
 
 
 def gate_infidelity(channel, target_channel):
-    """
-    Channel/superoperator average infidelity.
-
-    Here d_super = channel.shape[0].
-    This is the same convention you used for gate-channel comparison in the
-    notebook-style code.
-    """
     d_super = channel.shape[0]
     val = 1.0 - (
         np.abs(np.trace(target_channel.conj().T @ channel)) ** 2 + d_super
@@ -540,6 +484,54 @@ def noisy_infidelity_worker(task):
 # Plotting
 # =============================================================================
 
+def add_colorbar(fig, ax, im, label):
+    cbar = fig.colorbar(
+        im,
+        ax=ax,
+        pad=0.02,
+        fraction=0.046,
+        shrink=1.0,
+        aspect=25,
+    )
+    cbar.set_label(label)
+    return cbar
+
+
+def add_shared_colorbar(fig, axes, im, label):
+    cbar = fig.colorbar(
+        im,
+        ax=axes,
+        pad=0.02,
+        fraction=0.046,
+        shrink=1.0,
+        aspect=25,
+    )
+
+    pos0 = axes[0].get_position()
+
+    cbar.ax.set_position([
+        cbar.ax.get_position().x0,
+        pos0.y0,
+        cbar.ax.get_position().width,
+        pos0.y1 - pos0.y0,
+    ])
+
+    cbar.set_label(label)
+    return cbar
+
+
+def match_colorbar_height_to_axis(cbar, ax):
+    pos = ax.get_position()
+    cbar_pos = cbar.ax.get_position()
+
+    cbar.ax.set_position([
+        cbar_pos.x0,
+        pos.y0,
+        cbar_pos.width,
+        pos.y1 - pos.y0,
+    ])
+
+
 def add_met_contour(ax, theta_over_pi, durations_ns, logI_T_theta):
     level = np.log10(MET_THRESHOLD)
 
@@ -583,26 +575,20 @@ def plot_noisy_maps(
     ratio = base / ent
     log_ratio = np.log10(ratio).T
 
-    # Same colour scale for the first two infidelity maps only.
-    infid_vmin = np.nanmin([np.nanmin(log_base), np.nanmin(log_ent)])
-    infid_vmax = np.nanmax([np.nanmax(log_base), np.nanmax(log_ent)])
+    infid_vmin = -8
+    infid_vmax = 0
 
-    # Independent colour scale for the improvement-ratio map.
-    ratio_vmin = np.nanmin(log_ratio)
-    ratio_vmax = np.nanmax(log_ratio)
+    ratio_vmin = -3
+    ratio_vmax = 3
 
     fig, axes = plt.subplots(
         1,
         3,
-        figsize=(18, 5.2),
+        figsize=(15, 4.8),
+        constrained_layout=False,
         sharex=True,
         sharey=True,
-        constrained_layout=True,
     )
-
-    # -------------------------------------------------------------------------
-    # First two panels: noisy infidelity, shared scale and shared colourbar
-    # -------------------------------------------------------------------------
 
     im0 = axes[0].pcolormesh(
         theta_over_pi,
@@ -626,20 +612,50 @@ def plot_noisy_maps(
     )
     cs1 = add_met_contour(axes[1], theta_over_pi, durations_ns, log_ent)
 
-    axes[0].set_title("Baseline pulse")
-    axes[1].set_title("TEM pulse")
-
-    axes[0].set_ylabel("Duration / ns")
-    axes[0].set_xlabel(r"$\theta/\pi$")
-    axes[1].set_xlabel(r"$\theta/\pi$")
-
-    cbar_inf = fig.colorbar(
-        im1,
-        ax=axes[:2],
-        pad=0.02,
-        fraction=0.046,
+    im2 = axes[2].pcolormesh(
+        theta_over_pi,
+        durations_ns,
+        log_ratio,
+        shading="auto",
+        cmap="coolwarm",
+        vmin=ratio_vmin,
+        vmax=ratio_vmax,
     )
-    cbar_inf.set_label(r"$\log_{10}(\mathrm{noisy\ final\ infidelity})$")
+
+    axes[0].set_title("Baseline")
+    axes[1].set_title("TEM")
+    axes[2].set_title(r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$")
+
+    for ax in axes:
+        ax.set_xlabel(r"Excitation strength $\theta/\pi$")
+        ax.grid(True, alpha=0.25, linestyle="--")
+        ax.set_box_aspect(1)
+
+    axes[0].set_ylabel(r"Pulse duration $T$ / ns")
+
+    cbar_inf = add_shared_colorbar(
+        fig,
+        axes[:2],
+        im1,
+        r"$\log_{10}(\mathrm{noisy\ final\ infidelity})$",
+    )
+
+    cbar_ratio = add_colorbar(
+        fig,
+        axes[2],
+        im2,
+        r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$",
+    )
+
+    shared_pos = cbar_inf.ax.get_position()
+    right_pos = cbar_ratio.ax.get_position()
+
+    cbar_ratio.ax.set_position([
+        right_pos.x0,
+        shared_pos.y0,
+        right_pos.width,
+        shared_pos.height,
+    ])
 
     contour_handle = None
     if cs0 is not None:
@@ -655,40 +671,11 @@ def plot_noisy_maps(
             frameon=True,
         )
 
-    # -------------------------------------------------------------------------
-    # Third panel: improvement ratio, independent scale and colourbar
-    # -------------------------------------------------------------------------
-
-    im2 = axes[2].pcolormesh(
-        theta_over_pi,
-        durations_ns,
-        log_ratio,
-        shading="auto",
-        cmap="inferno",
-        vmin=ratio_vmin,
-        vmax=ratio_vmax,
-    )
-
-    axes[2].set_title(r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$")
-    axes[2].set_xlabel(r"$\theta/\pi$")
-
-    cbar_ratio = fig.colorbar(
-        im2,
-        ax=axes[2],
-        pad=0.02,
-        fraction=0.046,
-    )
-    cbar_ratio.set_label(r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$")
-
-    fig.suptitle(
-        rf"{system_name} noisy MET, $T_1={T1_US:.2e}\,\mu s$, "
-        rf"$T_2={T2_US:.2e}\,\mu s$"
-    )
-
     path = OUTDIR / f"{PLOT_PREFIX}_noisy_met.png"
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {path}")
+
 
 # =============================================================================
 # Main

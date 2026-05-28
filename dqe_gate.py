@@ -14,14 +14,14 @@ True  : First minimize infidelity, then run the entanglement-constrained
 
 Frame transformation
 --------------------
-Mirrors dqe_state.py.  Given user-supplied Zeeman splittings [B1,B2,B3,B4],
-we work in the rotating frame of the average Zeeman splitting:
+Given user-supplied Zeeman splittings [B1, B2, B3, B4], the system is
+constructed in the rotating frame of the average Zeeman splitting:
 
-    deltaB = B - mean(B)    (shape 4, per spin)
+    deltaB = B − mean(B)    (shape 4, per spin)
 
-The SpinChain is constructed with these shifted splittings.  The frame unitary
+The frame unitary
 
-    U_rot = expm(-i π (deltaB[0] Z₁ + deltaB[1] Z₂ - deltaB[2] Z₃ - deltaB[3] Z₄) T [ns→µs])
+    U_rot = expm(−i π Σ_k deltaB_k Z_k · T [ns→µs])
 
 dresses the target gate before forming the gate observable.
 
@@ -29,8 +29,8 @@ Gate entanglement measure
 -------------------------
 Set config.gate_ent_measure to any key in GATE_MEASURES_4Q
 (default: "operator_entanglement_sum_4q" — sum of operator entanglement over
-all 7 bipartitions).  Keys in GATE_MEASURES that are designed for 2-qubit
-gates will raise a ValueError.
+all 7 bipartitions).  Keys in GATE_MEASURES designed for 2-qubit gates will
+raise a ValueError.
 
 Performance note
 ----------------
@@ -40,64 +40,31 @@ Building 16 basis-state driven systems takes several seconds on the first run
 from __future__ import annotations
 
 import os
-import sys
 import numpy as np
 import tensorflow as tf
 from concurrent.futures import ThreadPoolExecutor
 from scipy.optimize import minimize
-from scipy.linalg import expm
 
+from qugradlab.systems.semiconducting.esr import SpinChain
 from .dataclasses import SimulationConfig, DQEGateResults, NS_TO_US
 from .entanglement_measures import (
     GATE_MEASURES,
     GATE_MEASURES_4Q,
     operator_entanglement_sum_4q,
 )
-
-# ---- Use local private QuGrad & QuGradLab for unpublished features ----
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_DIR = os.path.dirname(_THIS_DIR)
-sys.path.insert(0, os.path.join(_PROJECT_DIR, "QuGrad-Private", "src"))
-sys.path.insert(0, os.path.join(_PROJECT_DIR, "QuGradLab-Private", "src"))
-
-from qugradlab.systems.semiconducting.esr import SpinChain
+from ._utils import (
+    convert_dtype,
+    _initialise_x0,
+    dqe_unitary,
+    gate_infidelity,
+    get_gate_infidelity_traj,
+    make_rotating_frame,
+)
 
 
 # =============================================================================
 # Utilities
 # =============================================================================
-
-def convert_dtype(np_array) -> tf.Tensor:
-    return tf.cast(tf.convert_to_tensor(np_array), dtype=tf.complex128)
-
-
-def double_qubit_excitation(theta: float) -> np.ndarray:
-    """
-    Double-qubit excitation gate in the 4-spin (16-dim) Hilbert space.
-
-    Identity everywhere except the span{|0011⟩, |1100⟩} subspace:
-        |0011⟩ →  cos(θ)|0011⟩ - sin(θ)|1100⟩
-        |1100⟩ →  sin(θ)|0011⟩ + cos(θ)|1100⟩
-    """
-    U_dqe = np.eye(16, dtype=np.complex128)
-    c, s = np.cos(theta), np.sin(theta)
-    U_dqe[3, 3] =  c  
-    U_dqe[3, 12] = -s
-    U_dqe[12, 3] = s  
-    U_dqe[12, 12] = c
-    return U_dqe
-
-
-def gate_infidelity(U: np.ndarray, target: np.ndarray) -> float:
-    """Gate infidelity: 1 - (|Tr(U†T)|² + d) / (d(d+1))."""
-    d = U.shape[0]
-    return float(1.0 - (np.abs(np.trace(target.conj().T @ U)) ** 2 + d) / (d * (d + 1)))
-
-
-def get_gate_infidelity_traj(U_traj: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """Gate infidelity at each time step along U_traj, shape (n_t, 16, 16)."""
-    return np.array([gate_infidelity(U_traj[t], target) for t in range(U_traj.shape[0])])
-
 
 def get_gate_entanglement_traj(U_traj: np.ndarray,
                                 measure_fn=operator_entanglement_sum_4q) -> np.ndarray:
@@ -108,22 +75,6 @@ def get_gate_entanglement_traj(U_traj: np.ndarray,
 # =============================================================================
 # System construction
 # =============================================================================
-
-def _initialise_seed(config: SimulationConfig) -> None:
-    if config.J_init_seed is not None:
-        np.random.seed(int(config.J_init_seed))
-
-
-
-def _initialise_x0(config: SimulationConfig) -> np.ndarray:
-    """Initial control parameters, shape (n_time_steps * 3,), clipped to [-1, 1]."""
-    if getattr(config, "x0_override", None) is not None:
-        x0 = np.asarray(config.x0_override, dtype=float).copy()
-    else:
-        n = int(config.n_time_steps) * int(config.n_J_channels)
-        x0 = config.J_init_mean + float(config.J_init_scale) * np.random.uniform(-1.0, 1.0, size=n)
-    return np.clip(x0, -1.0, 1.0).astype(np.float64, copy=False)
-
 
 def _make_system(config: SimulationConfig) -> SpinChain:
     return SpinChain(
@@ -141,23 +92,21 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
     """
     Create a driven system for one initial state with piecewise-constant pulses.
 
-    The 3 J channels are packed as x.reshape(n_time_steps, 3) on the coarse
-    grid and repeated n_discretisation times for the fine grid.
+    The J channels are packed as x.reshape(n_time_steps, n_J_channels) on the
+    coarse grid and repeated n_discretisation times for the fine grid.
     """
-    n_steps = int(config.n_time_steps) # n+1 or n time steps (problem with fast oscillations)
-    n_disc = int(config.n_discretisation)
-    n_fine = n_steps * n_disc
+    n_steps    = int(config.n_time_steps)
+    n_disc     = int(config.n_discretisation)
+    n_fine     = n_steps * n_disc
     dt_fine_us = (float(config.T) / n_fine) * NS_TO_US
 
     def pulse_function(x):
-        #x_coarse = tf.reshape(tf.convert_to_tensor(x, dtype=tf.float64), (n_steps, 3))
-        x_coarse = tf.reshape(x, (n_steps, 3))
-
-        x_fine = tf.cast(tf.repeat(x_coarse, repeats=n_disc, axis=0), tf.complex128)
+        x_coarse = tf.reshape(x, (n_steps, config.n_J_channels))
+        x_fine   = tf.cast(tf.repeat(x_coarse, repeats=n_disc, axis=0), tf.complex128)
         return (
             convert_dtype(np.zeros((n_fine, 4))),     # drive amplitudes (4 spins, disabled)
             tf.zeros(4, dtype=tf.complex128),         # drive frequencies
-            x_fine,                                   # 3 J-channel amplitudes
+            x_fine,                                   # J-channel amplitudes
             convert_dtype(config.initial_state),      # initial state (16-dim)
             dt_fine_us * 2 * np.pi,                   # timestep (rad/µs)
         )
@@ -172,12 +121,12 @@ def _build_basis_driven_systems(config: SimulationConfig, sys: SpinChain) -> lis
     Constructed once before optimisation so TF graph compilation happens only
     once, not on every function evaluation.
     """
-    dim = 16
+    dim     = 16
     systems = []
     for i in range(dim):
-        basis = np.zeros(dim, dtype=np.complex128)
+        basis    = np.zeros(dim, dtype=np.complex128)
         basis[i] = 1.0
-        cfg_i = SimulationConfig(**vars(config))
+        cfg_i    = SimulationConfig(**vars(config))
         cfg_i.initial_state = basis
         systems.append(_make_driven_sys(cfg_i, sys))
     return systems
@@ -193,7 +142,7 @@ def _get_unitary_traj(config: SimulationConfig, sys: SpinChain, x: np.ndarray,
     U_traj : ndarray, shape (n_fine + 1, 16, 16)
         U_traj[t, :, i] = U(t)|i⟩.
     """
-    x = np.asarray(x, dtype=np.float64)
+    x      = np.asarray(x, dtype=np.float64)
     n_fine = int(config.n_time_steps) * int(config.n_discretisation)
     U_traj = np.zeros((n_fine + 1, 16, 16), dtype=np.complex128)
 
@@ -248,32 +197,30 @@ def _cost_gate_entanglement(basis_driven_systems: list, config: SimulationConfig
     """
     Mean-squared trajectory violation of the gate entanglement cap.
 
-    cost = mean((E(t) - E_max)₊²), where E is config.gate_ent_measure.
+    cost = mean((E(t) − E_max)₊²), where E is config.gate_ent_measure.
     """
     ent_fn = GATE_MEASURES[config.gate_ent_measure]
     U_traj = _get_unitary_traj(config, None, x, basis_driven_systems=basis_driven_systems)
-    viol = np.maximum(0.0, get_gate_entanglement_traj(U_traj, ent_fn) - ep_max)
+    viol   = np.maximum(0.0, get_gate_entanglement_traj(U_traj, ent_fn) - ep_max)
     return float(np.mean(viol ** 2))
 
 
 def _ep_grad_fd(basis_driven_systems: list, config: SimulationConfig, x: np.ndarray, *,
-                ep_max: float, eps: float, f0: float | None = None) -> np.ndarray:
+                ep_max: float, eps: float) -> np.ndarray:
     """
-    Forward-difference gradient of the gate entanglement cost, parallelised over parameters.
+    Central-difference gradient of the gate entanglement cost, parallelised over parameters.
 
-    Parameters
-    ----------
-    f0 : float, optional
-        Cost at the unperturbed x. Providing it avoids a redundant evaluation.
+    Uses (f(x+eps) − f(x−eps)) / (2·eps) for O(eps²) accuracy.
     """
     x = np.asarray(x, float)
-    if f0 is None:
-        f0 = _cost_gate_entanglement(basis_driven_systems, config, x, ep_max=ep_max)
 
     def _fi(i: int) -> float:
-        xp = x.copy()
-        xp[i] += eps
-        return (_cost_gate_entanglement(basis_driven_systems, config, xp, ep_max=ep_max) - f0) / eps
+        xp = x.copy(); xp[i] += eps
+        xm = x.copy(); xm[i] -= eps
+        return (
+            _cost_gate_entanglement(basis_driven_systems, config, xp, ep_max=ep_max)
+            - _cost_gate_entanglement(basis_driven_systems, config, xm, ep_max=ep_max)
+        ) / (2.0 * eps)
 
     with ThreadPoolExecutor(max_workers=min(len(x), os.cpu_count() or 1)) as pool:
         return np.array(list(pool.map(_fi, range(len(x)))), dtype=float)
@@ -287,19 +234,19 @@ def _lagrangian_and_grad(
     """
     Augmented Lagrangian value and gradient.
 
-    Objective: L = EP_cost + λ(GI - ε) + (ρ/2)(GI - ε)²
+    Objective: L = EP_cost + λ(GI − ε) + (ρ/2)(GI − ε)²
 
     where EP_cost is the mean-squared gate entanglement violation and
     GI is the gate infidelity (GI ≤ ε enforced via λ).
     """
-    EP = _cost_gate_entanglement(basis_driven_systems, config, x, ep_max=ep_max)
-    gEP = _ep_grad_fd(basis_driven_systems, config, x, ep_max=ep_max, eps=fd_eps, f0=EP)
+    EP  = _cost_gate_entanglement(basis_driven_systems, config, x, ep_max=ep_max)
+    gEP = _ep_grad_fd(basis_driven_systems, config, x, ep_max=ep_max, eps=fd_eps)
 
     gi, ggi = driven_sys.gate_gradient(x, target_gate)
     gi, ggi = float(gi), np.asarray(ggi, float)
     c = gi - float(eps_infidelity)
 
-    L = EP + lam * c + 0.5 * float(rho) * c ** 2
+    L  = EP + lam * c + 0.5 * float(rho) * c ** 2
     gL = gEP + (lam + float(rho) * c) * ggi
     return float(L), gL
 
@@ -312,10 +259,10 @@ def _primal_dual_optimise(
     Augmented Lagrangian primal-dual loop.
 
     Each outer iteration minimises the Lagrangian via L-BFGS-B, then updates
-    the dual variable λ ← max(0, λ + α(GI - ε)).
+    the dual variable λ ← max(0, λ + α(GI − ε)).
     """
-    x = np.asarray(x0, float).copy()
-    lam = 1.0
+    x      = np.asarray(x0, float).copy()
+    lam    = 1.0
     ep_max = float(config.S_max)
     hist: list[dict] = []
 
@@ -332,8 +279,8 @@ def _primal_dual_optimise(
         )
         x = np.asarray(res.x, float)
 
-        gi = float(driven_sys.gate_gradient(x, target_gate)[0])
-        c = gi - float(config.eps_infidelity)
+        gi  = float(driven_sys.gate_gradient(x, target_gate)[0])
+        c   = gi - float(config.eps_infidelity)
         lam = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
@@ -386,39 +333,19 @@ def dqe_gate_optimisation(config: SimulationConfig) -> DQEGateResults:
         if name not in GATE_MEASURES:
             raise ValueError(f"Unknown extra_ent_measure: {name!r}. Valid: {list(GATE_MEASURES)}")
 
-    _initialise_seed(config)
-    config.n_J_channels = 3
+    cfg = SimulationConfig(**vars(config))   # local copy — do not mutate caller's config
+    cfg.n_J_channels = 3
 
-    # --- Rotating frame ---
-    I2 = np.eye(2, dtype=np.complex128)
-    Z  = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
-    Z1 = np.kron(Z,  np.kron(I2, np.kron(I2, I2)))
-    Z2 = np.kron(I2, np.kron(Z,  np.kron(I2, I2)))
-    Z3 = np.kron(I2, np.kron(I2, np.kron(Z,  I2)))
-    Z4 = np.kron(I2, np.kron(I2, np.kron(I2, Z )))
-
-    B = np.array(config.zeeman_splittings, dtype=float)
-    deltaB = B - np.mean(B)
-
-    U_rot = expm(-1j * np.pi
-                 * (deltaB[0] * Z1 + deltaB[1] * Z2 + deltaB[2] * Z3 + deltaB[3] * Z4)
-                 * config.T * NS_TO_US)
-    target_gate = U_rot @ double_qubit_excitation(config.theta_target)
-
-    cfg = SimulationConfig(**vars(config))
+    deltaB, U_rot         = make_rotating_frame(cfg.zeeman_splittings, cfg.T)
+    target_gate           = U_rot @ dqe_unitary(cfg.theta_target)
     cfg.zeeman_splittings = deltaB
 
     if cfg.initial_state is None or len(cfg.initial_state) != 16:
         cfg.initial_state = np.zeros(16, dtype=np.complex128)
         cfg.initial_state[3] = 1.0  # |0011⟩ default
 
-    sys = _make_system(cfg)
+    sys        = _make_system(cfg)
     driven_sys = _make_driven_sys(cfg, sys)
-
-    # For checking that the driven system has the expected gate_gradient method.
-    #print(type(driven_sys))
-    #print(hasattr(driven_sys, "gate_gradient"))
-    #print([name for name in dir(driven_sys) if "grad" in name or "gate" in name])
 
     x0     = _initialise_x0(cfg)
     bounds = [(-1.0, 1.0)] * x0.size
@@ -455,8 +382,8 @@ def dqe_gate_optimisation(config: SimulationConfig) -> DQEGateResults:
             basis_driven_systems=basis_driven_systems,
         )
 
-    res, gn0 = _solve_infidelity(x0.copy())
-    baseline = _package_gate_results(
+    res, gn0  = _solve_infidelity(x0.copy())
+    baseline  = _package_gate_results(
         config=cfg, sys=sys, target_gate=target_gate,
         x0=x0, xf=res.x, success=res.success, nit=res.nit, grad_norm=gn0,
         basis_driven_systems=basis_driven_systems,

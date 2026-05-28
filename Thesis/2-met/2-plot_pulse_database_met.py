@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 
 INPUT_FILE = Path(
     "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE/"
-    "sqe_gate_mixedJ_pulses.npz"
+    "dqe_gate_positiveJ_rowprop_pulses.npz"
 )
 
 # Output goes to the same directory as this plotting script.

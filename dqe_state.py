@@ -14,8 +14,8 @@ True  : First minimize infidelity, then run the entropy-constrained primal-dual
 
 Frame transformation
 --------------------
-The system is constructed in the rotating frame of the average Zeeman splitting, 
-while the infidelity observable is constructed in the frame of each qubit.  
+The system is constructed in the rotating frame of the average Zeeman splitting,
+while the infidelity observable is constructed in the frame of each qubit.
 
 Entanglement cost
 -----------------
@@ -28,7 +28,6 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 from scipy.optimize import minimize
-from scipy.linalg import expm
 
 from qugradlab.systems.semiconducting.esr import SpinChain
 from .dataclasses import SimulationConfig, DQEResults, NS_TO_US
@@ -39,33 +38,17 @@ from .entanglement_measures import (
     entropy_sum_traj,
     ALL_BIPARTITIONS_4Q,
 )
+from ._utils import (
+    convert_dtype,
+    _initialise_x0,
+    dqe_unitary,
+    make_rotating_frame,
+)
 
 
 # =============================================================================
 # Utilities
 # =============================================================================
-
-def convert_dtype(np_array) -> tf.Tensor:
-    """Convert numpy array to TensorFlow complex128 tensor."""
-    return tf.cast(tf.convert_to_tensor(np_array), dtype=tf.complex128)
-
-
-def dqe_unitary(theta: float) -> np.ndarray:
-    """
-    Double-qubit excitation gate in the 4-spin (16-dim) Hilbert space.
-
-    Identity everywhere except the span{|0011⟩, |1100⟩} subspace:
-        |0011⟩ →  cos(θ)|0011⟩ - sin(θ)|1100⟩
-        |1100⟩ →  sin(θ)|0011⟩ + cos(θ)|1100⟩
-    """
-    U_dqe = np.eye(16, dtype=np.complex128)
-    c, s = np.cos(theta), np.sin(theta)
-    U_dqe[3, 3] =  c  
-    U_dqe[3, 12] = -s
-    U_dqe[12, 3] = s  
-    U_dqe[12, 12] = c
-    return U_dqe
-
 
 def basis_state(n_qubits: int, bitstring: str) -> np.ndarray:
     """Create a computational basis state from a binary string."""
@@ -80,44 +63,17 @@ def basis_state(n_qubits: int, bitstring: str) -> np.ndarray:
 # System construction
 # =============================================================================
 
-def _initialise_seed(config: SimulationConfig) -> None:
-    if config.J_init_seed is not None:
-        np.random.seed(int(config.J_init_seed))
-
-def _initialise_x0(config: SimulationConfig) -> np.ndarray:
-    """Initial control parameters, shape (n_time_steps * 3,), clipped to [-1, 1]."""
-    if getattr(config, "x0_override", None) is not None:
-        x0 = np.asarray(config.x0_override, dtype=float).copy()
-    else:
-        n = int(config.n_time_steps) * int(config.n_J_channels)
-        x0 = config.J_init_mean + float(config.J_init_scale) * np.random.uniform(-1.0, 1.0, size=n)
-    return np.clip(x0, -1.0, 1.0).astype(np.float64, copy=False)
-
-
 def _make_system_and_observable(config: SimulationConfig):
     """
     Build the rotating-frame SpinChain and the infidelity observable.
 
-    The system is constructed in the rotating frame of the average Zeeman splitting, while A is constructed in the frame of each qubit.
+    The system is constructed in the rotating frame of the average Zeeman
+    splitting; the observable is constructed in the frame of each qubit.
     """
-    I2 = np.eye(2, dtype=np.complex128)
-    Z  = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
-
-    Z0 = np.kron(Z, np.kron(I2, np.kron(I2, I2)))
-    Z1 = np.kron(I2, np.kron(Z, np.kron(I2, I2)))
-    Z2 = np.kron(I2, np.kron(I2, np.kron(Z, I2)))
-    Z3 = np.kron(I2, np.kron(I2, np.kron(I2, Z)))
-
-    B = np.array(config.zeeman_splittings, dtype=np.float64)
-    B_avg = np.mean(B)
-    deltaB = B - B_avg
-
-    U_rot = expm(-1j * np.pi 
-                 * (deltaB[0] * Z0 + deltaB[1] * Z1 + deltaB[2] * Z2 + deltaB[3] * Z3) 
-                 * config.T * NS_TO_US)
+    deltaB, U_rot = make_rotating_frame(config.zeeman_splittings, config.T)
 
     target_state = U_rot @ dqe_unitary(config.theta_target) @ config.initial_state
-    observable = np.eye(16, dtype=np.complex128) - np.outer(target_state, target_state.conj())
+    observable   = np.eye(16, dtype=np.complex128) - np.outer(target_state, target_state.conj())
 
     sys = SpinChain(
         spins=4,
@@ -135,21 +91,21 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
     """
     Create a driven system with piecewise-constant interpolation.
 
-    The 3 J channels are packed as x.reshape(n_time_steps, 3) on the coarse
-    grid and repeated n_discretisation times to obtain the fine grid.
+    The J channels are packed as x.reshape(n_time_steps, n_J_channels) on the
+    coarse grid and repeated n_discretisation times to obtain the fine grid.
     """
-    n_steps = config.n_time_steps
-    n_disc = config.n_discretisation
-    n_fine = n_steps * n_disc
+    n_steps    = config.n_time_steps
+    n_disc     = config.n_discretisation
+    n_fine     = n_steps * n_disc
     dt_fine_us = (config.T / n_fine) * NS_TO_US
 
     def pulse_function(x):
-        x_coarse = tf.reshape(convert_dtype(x), (n_steps, 3))
-        x_fine = tf.repeat(x_coarse, repeats=n_disc, axis=0)
+        x_coarse = tf.reshape(convert_dtype(x), (n_steps, config.n_J_channels))
+        x_fine   = tf.repeat(x_coarse, repeats=n_disc, axis=0)
         return (
             convert_dtype(np.zeros((n_fine, 4))),    # drive amplitudes (disabled)
             tf.zeros(4, dtype=tf.complex128),        # drive frequencies
-            x_fine,                                  # 3 J-channel amplitudes
+            x_fine,                                  # J-channel amplitudes
             convert_dtype(config.initial_state),     # initial state
             dt_fine_us * 2 * np.pi,                  # timestep (rad/µs)
         )
@@ -185,38 +141,29 @@ def _cost_entropy(driven_sys, x, *, S_max: float) -> float:
     """
     Mean-squared trajectory violation of the multipartite entanglement cap.
 
-    cost = mean( (Σ_P S_P(t) - S_max)₊² )
+    cost = mean( (Σ_P S_P(t) − S_max)₊² )
 
     where Σ_P sums over all 7 bipartitions in ALL_BIPARTITIONS_4Q.
     """
-    traj = np.asarray(driven_sys.propagate_all(x))   # (16, n_t)
-
-    # test: optimise the entropy between 01 and 23 only
-    #total_S = np.sum(entropy_bipartite_traj(traj, subsystem=(0,1), n_qubits=4))
-
+    traj    = np.asarray(driven_sys.propagate_all(x))   # (16, n_t)
     total_S = entropy_sum_traj(traj)
-    viol = np.maximum(0.0, total_S - S_max)
+    viol    = np.maximum(0.0, total_S - S_max)
     return float(np.mean(viol ** 2))
 
 
-def _entropy_grad_fd(driven_sys, x, *, S_max: float, eps: float,
-                     f0: float | None = None) -> np.ndarray:
+def _entropy_grad_fd(driven_sys, x, *, S_max: float, eps: float) -> np.ndarray:
     """
-    Forward-difference gradient of the entropy cost.
-
-    Parameters
-    ----------
-    f0 : float, optional
-        Cost at the unperturbed x. Providing it avoids a redundant evaluation.
+    Central-difference gradient of the entropy cost (O(eps²) error).
     """
     x = np.asarray(x, float)
-    if f0 is None:
-        f0 = _cost_entropy(driven_sys, x, S_max=S_max)
     g = np.empty_like(x)
     for i in range(len(x)):
-        xp = x.copy()
-        xp[i] += eps
-        g[i] = (_cost_entropy(driven_sys, xp, S_max=S_max) - f0) / eps
+        xp = x.copy(); xp[i] += eps
+        xm = x.copy(); xm[i] -= eps
+        g[i] = (
+            _cost_entropy(driven_sys, xp, S_max=S_max)
+            - _cost_entropy(driven_sys, xm, S_max=S_max)
+        ) / (2.0 * eps)
     return g
 
 
@@ -225,16 +172,16 @@ def _lagrangian_and_grad(driven_sys, x, *, observable, lam, S_max, fd_eps,
     """
     Augmented Lagrangian value and gradient.
 
-    Objective: L = S_cost + λ(I - ε) + (ρ/2)(I - ε)²
+    Objective: L = S_cost + λ(I − ε) + (ρ/2)(I − ε)²
 
     where S_cost is the mean-squared multipartite entanglement violation and
     I is the state infidelity (the constraint I ≤ ε is enforced via λ).
     """
     S  = _cost_entropy(driven_sys, x, S_max=S_max)
-    gS = _entropy_grad_fd(driven_sys, x, S_max=S_max, eps=fd_eps, f0=S)
+    gS = _entropy_grad_fd(driven_sys, x, S_max=S_max, eps=fd_eps)
 
     infidelity, grad_inf = driven_sys.gradient(x, observable)
-    infidelity = float(np.real(infidelity))
+    infidelity = max(0.0, float(np.real(infidelity)))   # guard against float64 cancellation
     grad_inf   = np.asarray(grad_inf, float)
     c = infidelity - eps_infidelity
 
@@ -249,7 +196,7 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds,
     Augmented Lagrangian primal-dual loop.
 
     Each outer iteration minimises the Lagrangian via L-BFGS-B, then updates
-    the dual variable λ ← max(0, λ + α(I - ε)).
+    the dual variable λ ← max(0, λ + α(I − ε)).
 
     Returns
     -------
@@ -274,11 +221,10 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds,
         )
         x = np.asarray(res.x, float)
 
-        S = _cost_entropy(driven_sys, x, S_max=float(config.S_max))
-
+        S          = _cost_entropy(driven_sys, x, S_max=float(config.S_max))
         infidelity = np.real(driven_sys.gradient(x, observable)[0])
-        c = infidelity - float(config.eps_infidelity)
-        lam = max(0.0, lam + float(config.dual_lr) * c)
+        c          = infidelity - float(config.eps_infidelity)
+        lam        = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
             "outer_iter": k, "lam": lam, "I_final": infidelity, "S": S,
@@ -322,13 +268,13 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
     -------
     DQEResults
     """
-    _initialise_seed(config)
+    config = SimulationConfig(**vars(config))   # local copy — do not mutate caller's config
     config.n_J_channels = 3
 
     sys, observable = _make_system_and_observable(config)
-    driven_sys = _make_driven_sys(config, sys)
+    driven_sys      = _make_driven_sys(config, sys)
 
-    x0 = _initialise_x0(config)
+    x0     = _initialise_x0(config)
     bounds = [(-1.0, 1.0)] * len(x0)
 
     def run_baseline(x_init):
@@ -338,9 +284,9 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
             options={"maxiter": int(config.maxiter), "gtol": float(config.gtol)},
         )
         gn = float(np.linalg.norm(res.jac)) if res.jac is not None else 0.0
-        S = _cost_entropy(driven_sys, res.x, S_max=float(config.S_max))
+        S  = _cost_entropy(driven_sys, res.x, S_max=float(config.S_max))
         print(f"Infidelity: I={res.fun:.3e}, nit={res.nit}, "
-              f"success={res.success}, grad_norm={gn:.3e}", f"S={S:.3e}")
+              f"success={res.success}, grad_norm={gn:.3e}, S={S:.3e}")
         return _package_results(
             config=config, driven_sys=driven_sys, observable=observable,
             x0=x_init, xf=np.asarray(res.x, float),
@@ -365,7 +311,7 @@ def dqe_optimisation(config: SimulationConfig) -> DQEResults:
     if not config.entanglement_optimisation:
         return run_baseline(x0)
 
-    baseline = run_baseline(x0.copy())
+    baseline    = run_baseline(x0.copy())
     constrained = run_entropy(x0.copy())
     constrained.baseline = baseline
     return constrained
