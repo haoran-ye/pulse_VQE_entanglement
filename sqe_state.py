@@ -1,14 +1,47 @@
 """
-Single Qubit Excitation (SQE) optimization for 2-spin systems.
+Single Qubit Excitation (SQE) state optimization for 2-spin systems.
 
-Optimizes piecewise-constant exchange coupling pulses to implement single-qubit
-gates while optionally constraining entanglement entropy via primal-dual methods.
+Physics
+-------
+A 2-spin chain (semiconductor spin qubits) is driven by a single piecewise-
+constant exchange coupling J(t).  The target operation is the SQE gate: a
+rotation by theta_target in the {|01⟩, |10⟩} subspace, acting as identity
+on |00⟩ and |11⟩.
 
-entanglement_optimisation flag
--------------------------------
-False : Minimize state infidelity only (uses QuGrad autodiff gradient).
-True  : First minimize infidelity, then run the entropy-constrained primal-dual
-        loop from the same x0; baseline result stored in results.baseline.
+The system is built in the rotating frame of the average Zeeman splitting.
+Free Zeeman precession at mean(B) is removed; only the relative detunings
+deltaB = B − mean(B) appear in the drift Hamiltonian.  The frame unitary
+U_rot dresses the target state so the infidelity is computed in that frame.
+
+Algorithm
+---------
+entanglement_optimisation = False
+    Minimize state infidelity
+
+        I = ⟨ψ(T) | I − |ψ_target⟩⟨ψ_target| | ψ(T)⟩
+
+    via L-BFGS-B using QuGrad autodiff gradients.
+
+entanglement_optimisation = True
+    1. Run the baseline (infidelity-only) optimisation to convergence.
+    2. Run the entropy-constrained primal-dual loop from the same x0.
+    The baseline result is stored in results.baseline for comparison.
+
+Entropy cost (primal-dual)
+--------------------------
+    cost(x) = mean_t( (E(t) − S_max)₊² )
+
+where E(t) is the state entanglement measure at time t, (·)₊ = max(0, ·)
+is the hinge function, and S_max is the entanglement cap.
+
+Augmented Lagrangian
+--------------------
+    L(x, λ) = cost(x) + λ(I(x) − ε) + (ρ/2)(I(x) − ε)²
+
+Dual update after each inner solve:
+    λ ← max(0, λ + α(I − ε))
+
+The max(0, ·) enforces non-negativity of λ (KKT condition).
 
 Entanglement measure
 --------------------
@@ -37,14 +70,22 @@ from ._utils import (
 
 def _make_system_and_observable(config: SimulationConfig):
     """
-    Create the 2-spin system and the infidelity observable I − |ψ_target⟩⟨ψ_target|.
+    Build the 2-spin SpinChain in the rotating frame and the infidelity observable.
 
-    The system is constructed in the rotating frame (symmetric Zeeman splittings
-    ±ΔB/2) and the target state is dressed by the corresponding frame unitary.
+    Returns
+    -------
+    sys : SpinChain
+        2-spin system with drift Hamiltonian using deltaB (relative detunings).
+    observable : ndarray, shape (4, 4)
+        I − |ψ_target⟩⟨ψ_target|.  Minimising ⟨ψ(T)|obs|ψ(T)⟩ is equivalent
+        to maximising the overlap with the target state.
     """
+    # Build rotating frame: deltaB = B − mean(B); U_rot = expm(−iπ H_frame T·1e-3)
     deltaB, U_rot = make_rotating_frame(config.zeeman_splittings, config.T)
 
+    # Target state in the rotating frame: apply gate, then dress with U_rot
     target_state = U_rot @ single_qubit_excitation(config.theta_target) @ config.initial_state
+    # Projector onto the complement of |ψ_target⟩; expectation value = infidelity
     observable   = np.eye(4, dtype=np.complex128) - np.outer(target_state, target_state.conj())
 
     sys = SpinChain(
@@ -63,23 +104,27 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
     """
     Create a driven system with piecewise-constant pulse interpolation.
 
-    Optimization parameters live on a coarse grid (n_time_steps); state
-    evolution uses a finer grid (n_time_steps × n_discretisation).
+    The optimiser works on a coarse grid of n_time_steps parameters per J channel.
+    Each parameter is held constant for n_discretisation fine steps, giving a
+    total of n_fine = n_time_steps × n_discretisation integration points.
     """
-    n_steps   = config.n_time_steps
-    n_disc    = config.n_discretisation
-    n_fine    = n_steps * n_disc
+    n_steps    = config.n_time_steps
+    n_disc     = config.n_discretisation
+    n_fine     = n_steps * n_disc
+    # Convert gate time from ns to µs (qugradlab time unit); × 2π for rad/µs
     dt_fine_us = (config.T / n_fine) * NS_TO_US
 
     def pulse_function(x):
+        # x is a flat vector of length n_steps × n_J_channels in [-1, 1]
         x_coarse = tf.reshape(convert_dtype(x), (n_steps, config.n_J_channels))
+        # Repeat each coarse step n_disc times → piecewise-constant fine grid
         x_fine   = tf.repeat(x_coarse, repeats=n_disc, axis=0)
         return (
             convert_dtype(np.zeros((n_fine, 2))),       # drive amplitudes (disabled)
-            convert_dtype(config.zeeman_splittings),    # drive frequencies
-            x_fine,                                     # J coupling amplitudes
-            convert_dtype(config.initial_state),        # initial state
-            dt_fine_us * 2 * np.pi,                     # timestep (rad/μs)
+            convert_dtype(config.zeeman_splittings),    # drive frequencies (needed by SpinChain API)
+            x_fine,                                     # J coupling amplitudes on fine grid
+            convert_dtype(config.initial_state),        # |ψ₀⟩
+            dt_fine_us * 2 * np.pi,                     # timestep in rad/µs
         )
 
     return sys.pulse_form(pulse_function)
@@ -142,19 +187,25 @@ def _lagrangian_and_grad(driven_sys, x, *, observable, lam, S_max, fd_eps,
     """
     Augmented Lagrangian value and gradient.
 
-    Objective: L = S_cost + λ(I − ε) + (ρ/2)(I − ε)²
+    L(x, λ) = S_cost(x) + λ·c + (ρ/2)·c²,  c = I(x) − ε
 
-    where S_cost is the mean-squared entanglement violation and I is the state
-    infidelity (the constraint I ≤ ε is enforced via λ).
+    where S_cost is the mean-squared entanglement hinge violation (primary
+    objective), I is the state infidelity (the constraint I ≤ ε enforced via λ),
+    and c is the constraint residual.
+
+    Gradient: ∇L = ∇S + (λ + ρ·c)·∇I
     """
+    # Primary objective: entanglement cost and its finite-difference gradient
     S  = _cost_entropy(driven_sys, x, S_max=S_max, ent_traj_fn=ent_traj_fn)
     gS = _entropy_grad_fd(driven_sys, x, S_max=S_max, eps=fd_eps, ent_traj_fn=ent_traj_fn)
 
+    # Constraint function: infidelity and its autodiff gradient (QuGrad)
     infidelity, grad_inf = driven_sys.gradient(x, observable)
-    infidelity = max(0.0, float(np.real(infidelity)))   # guard against float64 cancellation
+    infidelity = max(0.0, float(np.real(infidelity)))   # guard numerical noise from complex arithmetic
     grad_inf   = np.asarray(grad_inf, float)
-    c = infidelity - eps_infidelity
+    c = infidelity - eps_infidelity                      # constraint residual I − ε
 
+    # Augmented Lagrangian and its gradient
     L  = S + lam * c + 0.5 * rho * c**2
     gL = gS + (lam + rho * c) * grad_inf
     return float(L), gL
@@ -194,6 +245,7 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds, config: Simulat
         S          = _cost_entropy(driven_sys, x, S_max=float(config.S_max), ent_traj_fn=ent_traj_fn)
         infidelity = np.real(driven_sys.gradient(x, observable)[0])
         c          = infidelity - float(config.eps_infidelity)
+        # Dual ascent: λ ← max(0, λ + α(I−ε)); max(0,·) is the KKT projection
         lam        = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({

@@ -5,9 +5,27 @@ Consolidates functions that were previously duplicated across sqe_state,
 sqe_gate, sqe_state_noise, dqe_state, and dqe_gate:
   - TensorFlow dtype conversion
   - Random initial-parameter generation (thread-safe, no global state)
-  - Gate matrices: SQE and DQE rotations
-  - Gate infidelity / trajectory
+  - Gate matrices: SQE and DQE rotations in the computational basis
+  - Average gate infidelity and its trajectory version
   - Rotating-frame construction for an arbitrary number of spins
+
+Physics conventions
+-------------------
+Frequencies (Zeeman splittings, J couplings) are in MHz.  Time is in
+nanoseconds at the user interface and converted to µs internally (×1e-3)
+because qugradlab expects MHz × µs = dimensionless phase units.
+
+Rotating frame
+--------------
+The SpinChain Hamiltonian is built in the rotating frame of the *average*
+Zeeman splitting mean(B).  This removes the dominant free precession and
+leaves only the relative detunings deltaB = B − mean(B) as the drift term,
+making the optimisation landscape simpler.  The frame unitary
+
+    U_rot = expm(−i π Σ_k deltaB_k Z_k · T_ns · 1e-3)
+
+must dress the target state (or gate) before forming the observable, so
+that the infidelity is computed in the correct frame.
 """
 from __future__ import annotations
 
@@ -57,9 +75,21 @@ def single_qubit_excitation(theta: float) -> np.ndarray:
     """
     SQE rotation in the |01⟩ ↔ |10⟩ subspace.
 
-    Identity on |00⟩ and |11⟩.  Basis order: [|00⟩, |01⟩, |10⟩, |11⟩].
+    Acts as identity on |00⟩ and |11⟩, and as a 2D rotation
+
+        [[cos θ, −sin θ],
+         [sin θ,  cos θ]]
+
+    in the {|01⟩, |10⟩} subspace.  Basis order: [|00⟩, |01⟩, |10⟩, |11⟩]
+    (big-endian, index = int(bitstring, 2)).
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle in radians.  theta = π/2 gives the iSWAP-like gate.
     """
     c, s = np.cos(theta), np.sin(theta)
+    # 4×4 matrix: rows/cols ordered |00⟩, |01⟩, |10⟩, |11⟩
     return np.array(
         [[1, 0,  0, 0],
          [0, c, -s, 0],
@@ -75,13 +105,16 @@ def dqe_unitary(theta: float) -> np.ndarray:
 
     Rotates the |0011⟩ ↔ |1100⟩ subspace by theta; identity everywhere else.
     Basis order: big-endian, index = int(bitstring, 2).
+
+    Index mapping: |0011⟩ = index 3, |1100⟩ = index 12.
     """
     U = np.eye(16, dtype=np.complex128)
-    c, s     = np.cos(theta), np.sin(theta)
-    U[3, 3]  =  c
-    U[3, 12] = -s
-    U[12, 3] =  s
-    U[12, 12] = c
+    c, s = np.cos(theta), np.sin(theta)
+    # Place the 2D rotation in the {|0011⟩, |1100⟩} = {row/col 3, 12} block
+    U[3, 3]   =  c
+    U[3, 12]  = -s
+    U[12, 3]  =  s
+    U[12, 12] =  c
     return U
 
 
@@ -90,7 +123,14 @@ def dqe_unitary(theta: float) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def gate_infidelity(U: np.ndarray, target: np.ndarray) -> float:
-    """Average gate infidelity: 1 − (|Tr(target† U)|² + d) / (d(d+1))."""
+    """
+    Average gate infidelity between U and target.
+
+    Formula: 1 − (|Tr(target† U)|² + d) / (d(d+1))
+
+    This equals 1 − F where F is the Haar-averaged state fidelity
+    |⟨ψ|target† U|ψ⟩|² over random input states |ψ⟩ (Horodecki 1999).
+    """
     d = U.shape[0]
     return float(1.0 - (np.abs(np.trace(target.conj().T @ U)) ** 2 + d) / (d * (d + 1)))
 
@@ -126,6 +166,7 @@ def make_rotating_frame(
         expm(−i π Σ_k deltaB_k Z_k · T_ns · NS_TO_US).
     """
     B      = np.asarray(zeeman_splittings, dtype=np.float64)
+    # Shift to the average frame: only relative detunings drive the system
     deltaB = B - np.mean(B)
     n      = len(deltaB)
 
@@ -133,11 +174,16 @@ def make_rotating_frame(
     dim     = 2 ** n
     H_frame = np.zeros((dim, dim), dtype=np.complex128)
     for k in range(n):
+        # Zk = I^{⊗k} ⊗ Z ⊗ I^{⊗(n−k−1)}: single-qubit Z on site k
         Zk = np.kron(
             np.kron(np.eye(2 ** k,           dtype=np.complex128), Z),
                      np.eye(2 ** (n - k - 1), dtype=np.complex128),
         )
         H_frame += deltaB[k] * Zk
 
+    # U_rot = expm(−iπ H_frame T[ns] × 1e-3)
+    # The π factor comes from the 2π×freq×time convention in qugradlab:
+    # the Hamiltonian is written as H = π Σ_k ω_k σ_k so that a full cycle
+    # takes 1/ω μs and the timestep dt is multiplied by 2π inside qugradlab.
     U_rot = expm(-1j * np.pi * H_frame * T_ns * NS_TO_US)
     return deltaB, U_rot

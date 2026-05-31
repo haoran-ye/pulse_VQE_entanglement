@@ -1,3 +1,35 @@
+"""
+Plotting functions for SQE and DQE state optimization results.
+
+SQE state layout (plot_sqe_optimisation)
+-----------------------------------------
+Panel 0 : Control pulse J(t) in physical units (MHz)
+Panel 1 : State infidelity evolution (log scale)
+Panel 2 : Main state entanglement measure (config.state_ent_measure)
+Panel 3+: One panel per extra measure in config.extra_ent_measures
+
+DQE state layout (plot_dqe_optimisation)
+-----------------------------------------
+Panels 0-2 : Control pulses J₁₂, J₂₃, J₃₄ (one per coupling channel)
+Panel  3   : State infidelity evolution (log scale)
+Panel  4   : Total entanglement cost Σ_P S_P over all 7 bipartitions
+Panel  5+  : One panel per entry in config.dqe_plot_partitions
+
+Color convention
+----------------
+Blue  (#1f77b4) : initial (unoptimized) trajectory
+Green (#2ca02c) : infidelity-only optimized (I-optimised)
+Red   (#d62728) : entropy-constrained optimized (S-optimised)
+Black (dashed)  : target value
+
+Note on target lines
+--------------------
+Target entropy values are computed from the ideal gate matrix applied to
+config.initial_state, *without* the rotating frame correction.  This is
+intentional: the rotating frame unitary adds a global phase structure that
+does not affect entropy, so the simpler (no-frame) calculation gives the
+same target entropy at T and is used for a dashed reference line only.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -36,6 +68,7 @@ COLOR_TARGET         = 'black'
 
 
 def _rescale_J(x, J_min, J_max):
+    # Affine map from optimiser range [-1, 1] to physical J range [J_min, J_max] MHz
     return 0.5 * (J_max - J_min) * x + 0.5 * (J_max + J_min)
 
 
@@ -72,7 +105,7 @@ def plot_control_pulses(results: SQEResults, ax=None):
 
     ax.set_xlabel('Time (ns)')
     ax.set_ylabel(r'$J$ (MHz)')
-    ax.set_title('Control Pulse')
+    ax.set_title(r'(a) Control pulse $J(t)$')
     ax.legend()
     return ax
 
@@ -97,7 +130,7 @@ def plot_infidelity_evolution(results: SQEResults, ax=None):
     ax.set_ylabel('Infidelity')
     ax.set_yscale('log')
     ax.set_ylim(top=5.0)
-    ax.set_title('Infidelity Evolution')
+    ax.set_title(r'(b) Infidelity evolution')
     ax.legend()
     return ax
 
@@ -130,7 +163,8 @@ def plot_entanglement_evolution(results: SQEResults, ax=None, *,
     label, color = _run_label_color(config.entanglement_optimisation)
     ax.plot(t, traj_fn(results.final_traj), label=label, color=color, zorder=4)
 
-    # Target entropy line
+    # Target entropy line: apply gate to initial state (no rotating frame correction
+    # needed here — the frame unitary is global-phase-like and does not change entropy)
     if config.initial_state is not None:
         target_state = single_qubit_excitation(config.theta_target) @ config.initial_state
         target_value = single_fn(target_state)
@@ -140,7 +174,7 @@ def plot_entanglement_evolution(results: SQEResults, ax=None, *,
     ax.set_xlabel('Time (ns)')
     ax.set_ylabel(STATE_MEASURE_LABELS.get(measure_name, measure_name))
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title(STATE_MEASURE_TITLES.get(measure_name, f'{measure_name} Evolution'))
+    ax.set_title(f"(c) {STATE_MEASURE_TITLES.get(measure_name, f'{measure_name} evolution')}")
     ax.legend()
     return ax
 
@@ -288,19 +322,25 @@ def plot_entanglement_cost_dqe(results: DQEResults, ax=None):
 
 def plot_partition_entropy_dqe(results: DQEResults, ax=None, *, partition=(0, 1)):
     """
-    Plot the bipartite entropy S(A|B) for a specific partition.
+    Plot the bipartite von Neumann entropy S(A|B) for a specific partition.
 
     Parameters
     ----------
     partition : tuple[int, ...]
         Qubit indices forming subsystem A (big-endian, 0-indexed).
         E.g. (0, 1) → entropy of qubits {0,1} vs {2,3}.
+
+    Notes
+    -----
+    The complement B = {0,1,2,3} \\ A is shown in the panel title.
+    S(A) = S(B) for pure states, so either side gives the same number.
     """
     if ax is None:
         ax = plt.gca()
     config     = results.config
     t          = _fine_time(config)
     partition  = tuple(partition)
+    # Complement qubits: the other side of the bipartition
     complement = tuple(q for q in range(4) if q not in partition)
 
     def _S(traj):

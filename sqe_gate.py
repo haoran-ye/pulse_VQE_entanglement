@@ -96,17 +96,21 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
 
 def _build_basis_driven_systems(config: SimulationConfig, sys: SpinChain) -> list:
     """
-    Build one driven system per computational basis state.
+    Build one driven system per computational basis state of a 2-qubit system.
 
-    Constructed once before optimisation so TF graph compilation happens only
-    once, not on every function evaluation. Each system propagates a single
-    basis vector, allowing reconstruction of the full unitary trajectory.
+    The full unitary U(t) is reconstructed from its columns: U(t)|i⟩ for each
+    basis vector |i⟩.  Building these systems once before optimisation ensures
+    that TF graph compilation occurs only once (not per function evaluation).
+
+    Returns
+    -------
+    list of 4 driven systems, one per basis state |00⟩, |01⟩, |10⟩, |11⟩.
     """
     dim     = 4
     systems = []
     for i in range(dim):
         basis    = np.zeros(dim, dtype=np.complex128)
-        basis[i] = 1.0
+        basis[i] = 1.0                     # |i⟩ computational basis state
         cfg_i    = SimulationConfig(**vars(config))
         cfg_i.initial_state = basis
         systems.append(_make_driven_sys(cfg_i, sys))
@@ -135,6 +139,8 @@ def _get_unitary_traj(config: SimulationConfig, sys: SpinChain, x: np.ndarray,
         basis_driven_systems = _build_basis_driven_systems(config, sys)
 
     for i, ds in enumerate(basis_driven_systems):
+        # propagate_all returns shape (4, n_fine+1); each column is U(t)|i⟩.
+        # Store in U_traj[:, :, i] so U_traj[t] is the full unitary at time t.
         U_traj[:, :, i] = np.asarray(ds.propagate_all(x)).T
 
     return U_traj
@@ -243,13 +249,16 @@ def _lagrangian_and_grad(
     where EP_cost is the mean-squared entanglement violation and GI is the gate
     infidelity (GI ≤ ε enforced via λ).
     """
+    # Gate entanglement cost and its parallelised central-difference gradient
     EP  = _cost_entangling_power(basis_driven_systems, config, x, ep_max=ep_max)
     gEP = _ep_grad_fd(basis_driven_systems, config, x, ep_max=ep_max, eps=fd_eps)
 
+    # Gate infidelity and its autodiff gradient (QuGrad gate_gradient method)
     gi, ggi = driven_sys.gate_gradient(x, target_gate)
     gi, ggi = float(gi), np.asarray(ggi, float)
-    c = gi - float(eps_infidelity)
+    c = gi - float(eps_infidelity)           # constraint residual GI − ε
 
+    # L = EP + λ(GI−ε) + (ρ/2)(GI−ε)²,  ∇L = ∇EP + (λ + ρc)∇GI
     L  = EP + lam * c + 0.5 * float(rho) * c**2
     gL = gEP + (lam + float(rho) * c) * ggi
     return float(L), gL
@@ -291,6 +300,7 @@ def _primal_dual_optimise(
 
         gi  = float(driven_sys.gate_gradient(x, target_gate)[0])
         c   = gi - float(config.eps_infidelity)
+        # Dual ascent: λ ← max(0, λ + α(GI−ε)); max(0,·) is the KKT projection
         lam = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
@@ -347,9 +357,10 @@ def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
 
     cfg = SimulationConfig(**vars(config))   # local copy — do not mutate caller's config
 
+    # Build the rotating frame: deltaB = B − mean(B); dress target gate with U_rot
     deltaB, U_rot         = make_rotating_frame(cfg.zeeman_splittings, cfg.T)
     target_gate           = U_rot @ single_qubit_excitation(cfg.theta_target)
-    cfg.zeeman_splittings = deltaB
+    cfg.zeeman_splittings = deltaB               # SpinChain uses relative detunings
 
     sys        = _make_system(cfg)
     driven_sys = _make_driven_sys(cfg, sys)
@@ -357,7 +368,8 @@ def sqe_gate_optimisation(config: SimulationConfig) -> SQEGateResults:
     x0     = _initialise_x0(cfg)
     bounds = [(-1.0, 1.0)] * x0.size
 
-    # Build TF graphs once; reused by every entanglement cost evaluation.
+    # Build 4 basis-state driven systems once — TF graph compilation happens here
+    # and is reused for all entanglement cost evaluations throughout optimisation.
     basis_driven_systems = _build_basis_driven_systems(cfg, sys)
 
     def _solve_infidelity(x_init: np.ndarray):

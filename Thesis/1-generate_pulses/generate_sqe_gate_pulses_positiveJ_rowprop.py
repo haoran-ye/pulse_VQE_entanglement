@@ -2,77 +2,86 @@
 """
 generate_sqe_gate_pulses_positiveJ_rowprop.py
 
-SQE-gate pulse database with theta-continuation.
+SQE-gate pulse database with theta-continuation (row-propagation).
 
-Grid convention:
-    arrays have shape (n_theta, n_T, n_init_slots)
+Grid convention
+---------------
+    All saved arrays have shape (n_theta, n_T, n_init_slots).
 
-For each fixed duration T, one worker scans theta from low to high.
+Worker strategy
+---------------
+One worker process handles one fixed duration T and scans theta from low to high.
 
-Initialisation strategy:
-    - first N_BOOTSTRAP_THETAS theta values: normal random initialisations
-    - later theta values:
-        baseline:
-            try propagated baseline x from previous accepted theta first
-        TEM:
-            try propagated TEM x from previous accepted theta first
-            first with infidelity-only repair
-            then, if needed, primal-dual entanglement optimisation
-        fallback:
-            if propagation is not accepted, run normal random initialisations
+For each theta:
+  Baseline (infidelity-only):
+    - First N_BOOTSTRAP_THETAS thetas: random initialisation only.
+    - Later thetas: try propagating the best accepted baseline pulse from the
+      previous theta.  If propagation passes the acceptance test and
+      SKIP_RANDOM_IF_BASELINE_PROP_ACCEPTED is True, skip the random starts.
+    - If propagation fails or is skipped, run N_RANDOM_INITS random starts.
 
-Compatibility:
-    The usual arrays are still saved:
-        baseline_final_infids
-        ent_final_infids
-        baseline_ent_avg
-        ent_ent_avg
-        baseline_x_final
-        ent_x_final
-        etc.
+  TEM (entropy-penalised):
+    - Same bootstrap/propagation logic as baseline.
+    - Propagation: first try infidelity-only repair from the previous TEM pulse;
+      if that fails the entanglement acceptance test, follow with a primal-dual
+      constrained run starting from the repaired pulse.
+    - Acceptance: infidelity below threshold AND (≥20% entropy reduction OR
+      S_tem ≤ TEM_ABSOLUTE_ENT_THRESHOLD).
 
-Extra propagation metadata arrays are also saved, but old plotting scripts should ignore them.
+Output
+------
+    PULSES_DATABASE/sqe_gate_positiveJ_rowprop_pulses.npz
+
+Extra metadata arrays (propagation bookkeeping) are saved alongside the standard
+arrays (baseline_final_infids, ent_final_infids, etc.); old plotting scripts can
+ignore the extras.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import multiprocessing as mp
 from pathlib import Path
-from dataclasses import replace, fields, is_dataclass
 from typing import Any
 
 import numpy as np
 from tqdm import tqdm
 
-
-# ============================================================
-# Thread control
-# ============================================================
-
+# Limit BLAS/OpenMP threads per worker to avoid oversubscription.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-
-ROOT = Path(__file__).resolve().parents[3]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# pulse_vqe_entanglement is not pip-installed; add the repo root to sys.path.
+import sys as _sys
+_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+del _sys, _ROOT
 
 from pulse_vqe_entanglement.dataclasses import SimulationConfig
 from pulse_vqe_entanglement.sqe_gate import sqe_gate_optimisation
+
+# Shared helpers: config manipulation, result extraction, array utilities.
+from thesis_utils import (
+    CONFIG_FIELDS,           # set of valid SimulationConfig field names
+    filter_kwargs_for_config,
+    safe_replace_config,
+    extract_gate_result_arrays,
+    fixed_width_x,
+    nanmean_safe,            # replaces average_entanglement
+    nanmax_safe,             # replaces max_entanglement
+)
 
 
 # ============================================================
 # Settings
 # ============================================================
 
-PULSES_DATABASE = Path(
-    "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE"
-)
+# B1: resolved relative to this file so the script works on any machine.
+PULSES_DATABASE = Path(__file__).resolve().parent.parent / "PULSES_DATABASE"
 
 SYSTEM_NAME = "sqe_gate"
 PULSE_FAMILY_LABEL = "positiveJ_rowprop"
@@ -82,28 +91,31 @@ OUTDIR.mkdir(parents=True, exist_ok=True)
 
 RAW_OUT = OUTDIR / f"{SYSTEM_NAME}_{PULSE_FAMILY_LABEL}_pulses.npz"
 
+# Theta grid: fine near zero + coarser large-angle sweep.
 small_thetas = np.linspace(0.0 * np.pi, 0.009 * np.pi, 10)
 large_thetas = np.linspace(0.01 * np.pi, 0.50 * np.pi, 40)
 THETAS = np.concatenate([small_thetas, large_thetas])
 
-DURATIONS_NS = np.arange(1.0, 1200.0, 15.0)
+DURATIONS_NS = np.arange(1.0, 1200.0, 15.0)   # one row-worker per duration
 
-#DURATIONS_NS = np.arange(1.0, 1200.0, 60.0)
-
+# Each grid point has two init slots:
+#   PROP_SLOT (0): used by the propagated-init run (when available)
+#   RANDOM_SLOT0 (1): random-init run
 N_RANDOM_INITS = 1
-N_INIT_SLOTS = N_RANDOM_INITS + 1      # slot 0 reserved for propagation when available
+N_INIT_SLOTS = N_RANDOM_INITS + 1
 PROP_SLOT = 0
 RANDOM_SLOT0 = 1
 
-N_WORKERS = 9
-SEED0 = 1234
-CHECKPOINT_EVERY_ROWS = 1
+N_WORKERS = 9         # parallel row-worker processes
+SEED0 = 1234          # master RNG seed for reproducibility
+CHECKPOINT_EVERY_ROWS = 1  # save after every completed duration row
 
 INFIDELITY_THRESHOLD = 1e-5
 INFIDELITY_FLOOR = 1e-14
 
-N_TIME_STEPS = 50
+N_TIME_STEPS = 50             # fixed for SQE gate
 
+# Augmented Lagrangian / TEM optimiser hyperparameters.
 N_OUTER = 3
 INNER_MAXITER = 200
 EPS_INFIDELITY = 1e-12
@@ -112,41 +124,40 @@ RHO = 0.0
 FD_EPS = 1e-6
 
 GATE_ENT_MEASURE = "operator_entanglement"
-ENTANGLEMENT_MARGIN = 0.01
+ENTANGLEMENT_MARGIN = 0.01  # S_max for gate entanglement constraint
 
-J_INIT_MEANS = np.array(
-    [0.0] * (N_RANDOM_INITS // 2)
-    + [0.0] * (N_RANDOM_INITS - N_RANDOM_INITS // 2),
-    dtype=float,
-)
+# B4: was [0.0]*(N//2) + [0.0]*(N-N//2) which always gives zeros.
+J_INIT_MEANS = np.zeros(N_RANDOM_INITS, dtype=float)
 
-ZEEMAN = np.array([1000.0, 1008.0])
+ZEEMAN = np.array([1000.0, 1008.0])                                    # MHz
 DUMMY_INITIAL_STATE = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.complex128)
 
 # ------------------------------------------------------------
 # Propagation controls
 # ------------------------------------------------------------
 
+# Thetas with index < N_BOOTSTRAP_THETAS always use random initialisations
+# (no propagation attempt) so the chain has a clean starting point.
 N_BOOTSTRAP_THETAS = 2
 
+# Baseline propagation acceptance thresholds.
 BASELINE_PROPAGATE_INF_THRESHOLD = 1e-4
-BASELINE_MAX_LOG10_WORSENING = 5.0
+BASELINE_MAX_LOG10_WORSENING = 5.0   # allow up to 10^5 worse infidelity
 
+# TEM propagation acceptance thresholds.
 TEM_PROPAGATE_INF_THRESHOLD = 1e-4
 TEM_MAX_LOG10_WORSENING = 5.0
+TEM_MIN_RELATIVE_ENT_REDUCTION = 0.20   # ≥20% entropy reduction required
+TEM_ABSOLUTE_ENT_THRESHOLD = 0.5        # OR absolute S_tem below this
+ENT_REDUCTION_DENOM_FLOOR = 1e-8       # floor in relative reduction denominator
 
-TEM_MIN_RELATIVE_ENT_REDUCTION = 0.20
-TEM_ABSOLUTE_ENT_THRESHOLD = 0.5
-ENT_REDUCTION_DENOM_FLOOR = 1e-8
-
-# If a propagated pulse succeeds and passes these tests, random starts are skipped.
+# Skip random initialisations if propagation is accepted.
 SKIP_RANDOM_IF_BASELINE_PROP_ACCEPTED = True
 SKIP_RANDOM_IF_TEM_PROP_ACCEPTED = True
 
-# Candidate field names for explicit initial pulse in SimulationConfig.
-# If your SimulationConfig uses a different name, add it here.
+# Name of the SimulationConfig field used to inject an explicit initial pulse.
+# If the field doesn't exist in the config, propagation will raise at runtime.
 CONFIG_X0_FIELD_CANDIDATES = ["x0_override"]
-
 
 BASE_CONFIG_KWARGS: dict[str, Any] = dict(
     zeeman_splittings=ZEEMAN,
@@ -156,48 +167,39 @@ BASE_CONFIG_KWARGS: dict[str, Any] = dict(
     n_discretisation=1,
     T=200.0,
     max_drive_strength=0.0,
-
     J_max=10.0,
     J_min=0.0,
-
     J_init_scale=1e-1,
     J_init_mean=0.0,
     feromagnetic=False,
     gtol=1e-12,
     maxiter=500,
-
     entanglement_optimisation=False,
     optimisation_target="gate",
     gate_ent_measure=GATE_ENT_MEASURE,
-
     J_init_seed=None,
     S_max=ENTANGLEMENT_MARGIN,
-
     eps_infidelity=EPS_INFIDELITY,
     rho=RHO,
     dual_lr=DUAL_LR,
     n_outer=N_OUTER,
     inner_maxiter=INNER_MAXITER,
     fd_eps=FD_EPS,
-
     n_J_channels=1,
 )
 
 
+def make_base_config() -> SimulationConfig:
+    """Construct the base SimulationConfig, dropping any unknown kwargs."""
+    return SimulationConfig(**filter_kwargs_for_config(BASE_CONFIG_KWARGS))
+
+
 # ============================================================
-# Dataclass helpers
+# Propagation helpers (unique to rowprop — not in thesis_utils)
 # ============================================================
-
-def dataclass_field_names(cls: type) -> set[str]:
-    if not is_dataclass(cls):
-        return set()
-    return {f.name for f in fields(cls)}
-
-
-CONFIG_FIELDS = dataclass_field_names(SimulationConfig)
-
 
 def infer_x0_field() -> str | None:
+    """Return the first CONFIG_X0_FIELD_CANDIDATES name that exists in SimulationConfig."""
     for name in CONFIG_X0_FIELD_CANDIDATES:
         if name in CONFIG_FIELDS:
             return name
@@ -207,136 +209,36 @@ def infer_x0_field() -> str | None:
 CONFIG_X0_FIELD = infer_x0_field()
 
 
-def filter_kwargs_for_config(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in kwargs.items() if k in CONFIG_FIELDS}
-
-
-def make_base_config() -> SimulationConfig:
-    return SimulationConfig(**filter_kwargs_for_config(BASE_CONFIG_KWARGS))
-
-
-def safe_replace_config(config: SimulationConfig, **kwargs: Any) -> SimulationConfig:
-    return replace(config, **filter_kwargs_for_config(kwargs))
-
-
 def add_initial_x(kwargs: dict[str, Any], x0: np.ndarray | None) -> dict[str, Any]:
+    """Inject x0 into the kwargs dict via the detected CONFIG_X0_FIELD."""
     kwargs = dict(kwargs)
     if x0 is None:
         return kwargs
-
     if CONFIG_X0_FIELD is None:
         raise RuntimeError(
-            "No explicit initial-pulse field was found in SimulationConfig. "
-            "Add the correct field name to CONFIG_X0_FIELD_CANDIDATES."
+            "No explicit initial-pulse field found in SimulationConfig. "
+            "Add the correct name to CONFIG_X0_FIELD_CANDIDATES."
         )
-
     kwargs[CONFIG_X0_FIELD] = np.asarray(x0, dtype=float).reshape(-1)
     return kwargs
 
 
-# ============================================================
-# Result helpers
-# ============================================================
-
-def get_attr_any(obj: Any, names: list[str], default: Any = None) -> Any:
-    for name in names:
-        if hasattr(obj, name):
-            return getattr(obj, name)
-    return default
-
-
-def as_1d_float_array(x: Any) -> np.ndarray:
-    if x is None:
-        return np.array([], dtype=float)
-    return np.asarray(x, dtype=float).reshape(-1)
-
-
-def fixed_width_x(x: Any, width: int) -> np.ndarray:
-    out = np.full(width, np.nan, dtype=float)
-    if x is None:
-        return out
-
-    arr = np.asarray(x, dtype=float).reshape(-1)
-    n = min(width, arr.size)
-    out[:n] = arr[:n]
-    return out
-
-
-def average_entanglement(entanglements: np.ndarray) -> float:
-    entanglements = as_1d_float_array(entanglements)
-    if entanglements.size == 0 or np.all(~np.isfinite(entanglements)):
-        return np.nan
-    return float(np.nanmean(entanglements))
-
-
-def max_entanglement(entanglements: np.ndarray) -> float:
-    entanglements = as_1d_float_array(entanglements)
-    if entanglements.size == 0 or np.all(~np.isfinite(entanglements)):
-        return np.nan
-    return float(np.nanmax(entanglements))
-
-
-def extract_result_arrays(result: Any) -> dict[str, Any]:
-    infidelities = as_1d_float_array(
-        get_attr_any(
-            result,
-            [
-                "infid_final",
-                "infidelities",
-                "infidelity_evolution",
-                "gate_infidelities",
-                "val_final",
-            ],
-        )
-    )
-
-    final_infid = get_attr_any(
-        result,
-        ["final_infidelity", "best_infidelity", "infidelity"],
-        default=None,
-    )
-    if final_infid is None:
-        final_infid = float(infidelities[-1]) if infidelities.size else np.nan
-
-    entanglements = as_1d_float_array(
-        get_attr_any(
-            result,
-            [
-                "entanglements",
-                "gate_entanglements",
-                "ent_final",
-                "S_final",
-                "entropy_final",
-                "entanglement_final",
-            ],
-        )
-    )
-
-    return dict(
-        infidelities=infidelities,
-        entanglements=entanglements,
-        x0=get_attr_any(result, ["x0", "x_initial", "initial_x"]),
-        x_final=get_attr_any(result, ["x_final", "x_opt", "x", "optimised_x", "optimized_x"]),
-        final_infid=float(final_infid),
-        n_iterations=get_attr_any(result, ["n_iterations", "nit", "iterations"], default=np.nan),
-        gradient_norm=get_attr_any(result, ["gradient_norm", "grad_norm"], default=np.nan),
-        optimization_success=bool(get_attr_any(result, ["optimization_success", "success"], default=False)),
-    )
-
-
 def clean_infid(x: float) -> float:
+    """Clip infidelity to INFIDELITY_FLOOR; return NaN for non-finite values."""
     if not np.isfinite(x):
         return np.nan
     return max(float(x), INFIDELITY_FLOOR)
 
 
 def log10_infid(x: float) -> float:
+    """log10 of infidelity (clamped to floor); returns inf for non-finite input."""
     if not np.isfinite(x):
         return np.inf
     return float(np.log10(max(float(x), INFIDELITY_FLOOR)))
 
 
 def relative_ent_reduction(S_base: float, S_tem: float) -> float:
+    """(S_base - S_tem) / max(S_base, floor); NaN if either is non-finite."""
     if not np.isfinite(S_base) or not np.isfinite(S_tem):
         return np.nan
     denom = max(float(S_base), ENT_REDUCTION_DENOM_FLOOR)
@@ -347,7 +249,10 @@ def relative_ent_reduction(S_base: float, S_tem: float) -> float:
 # Single optimisation calls
 # ============================================================
 
-def common_config_kwargs(theta: float, T_ns: float, seed: int | None, j_init_mean: float) -> dict[str, Any]:
+def common_config_kwargs(
+    theta: float, T_ns: float, seed: int | None, j_init_mean: float
+) -> dict[str, Any]:
+    """Return per-job config overrides shared by baseline and TEM runs."""
     return dict(
         theta_target=float(theta),
         T=float(T_ns),
@@ -376,25 +281,22 @@ def run_baseline_once(
     j_init_mean: float,
     x0: np.ndarray | None,
 ) -> dict[str, Any]:
+    """Run one infidelity-only optimisation and return a flat result dict."""
     kwargs = common_config_kwargs(theta, T_ns, seed, j_init_mean)
     kwargs = add_initial_x(kwargs, x0)
 
-    config = safe_replace_config(
-        base_config,
-        **kwargs,
-        entanglement_optimisation=False,
-    )
-
+    config = safe_replace_config(base_config, **kwargs, entanglement_optimisation=False)
     result = sqe_gate_optimisation(config)
-    arr = extract_result_arrays(result)
+    arr = extract_gate_result_arrays(result)
 
     I = clean_infid(arr["final_infid"])
     return dict(
         success=np.isfinite(I) and I <= INFIDELITY_THRESHOLD,
         optimization_success=arr["optimization_success"],
         final_infid=I,
-        ent_avg=average_entanglement(arr["entanglements"]),
-        ent_max=max_entanglement(arr["entanglements"]),
+        ent_avg=nanmean_safe(arr["entanglements"]),
+        ent_max=nanmax_safe(arr["entanglements"]),
+        # Fall back to x0 if x_initial not recorded by the optimiser.
         x0=fixed_width_x(arr["x0"] if arr["x0"] is not None else x0, N_TIME_STEPS),
         x_final=fixed_width_x(arr["x_final"], N_TIME_STEPS),
         n_iterations=arr["n_iterations"],
@@ -412,25 +314,22 @@ def run_tem_once(
     x0: np.ndarray | None,
     entanglement_optimisation: bool,
 ) -> dict[str, Any]:
+    """Run one TEM (or baseline-repair) optimisation and return a flat result dict."""
     kwargs = common_config_kwargs(theta, T_ns, seed, j_init_mean)
     kwargs = add_initial_x(kwargs, x0)
 
-    config = safe_replace_config(
-        base_config,
-        **kwargs,
-        entanglement_optimisation=bool(entanglement_optimisation),
-    )
-
+    config = safe_replace_config(base_config, **kwargs,
+                                 entanglement_optimisation=bool(entanglement_optimisation))
     result = sqe_gate_optimisation(config)
-    arr = extract_result_arrays(result)
+    arr = extract_gate_result_arrays(result)
 
     I = clean_infid(arr["final_infid"])
     return dict(
         success=np.isfinite(I) and I <= INFIDELITY_THRESHOLD,
         optimization_success=arr["optimization_success"],
         final_infid=I,
-        ent_avg=average_entanglement(arr["entanglements"]),
-        ent_max=max_entanglement(arr["entanglements"]),
+        ent_avg=nanmean_safe(arr["entanglements"]),
+        ent_max=nanmax_safe(arr["entanglements"]),
         x0=fixed_width_x(arr["x0"] if arr["x0"] is not None else x0, N_TIME_STEPS),
         x_final=fixed_width_x(arr["x_final"], N_TIME_STEPS),
         n_iterations=arr["n_iterations"],
@@ -443,57 +342,37 @@ def run_tem_once(
 # Acceptance tests
 # ============================================================
 
-def baseline_propagation_ok(
-    *,
-    I_new: float,
-    I_prev: float,
-) -> bool:
+def baseline_propagation_ok(*, I_new: float, I_prev: float) -> bool:
+    """True if the propagated pulse passes infidelity and worsening thresholds."""
     if not np.isfinite(I_new):
         return False
-
     if I_new > BASELINE_PROPAGATE_INF_THRESHOLD:
         return False
-
     if np.isfinite(I_prev):
         if log10_infid(I_new) > log10_infid(I_prev) + BASELINE_MAX_LOG10_WORSENING:
             return False
-
     return True
 
 
-def tem_entanglement_ok(
-    *,
-    S_base: float,
-    S_tem: float,
-) -> bool:
+def tem_entanglement_ok(*, S_base: float, S_tem: float) -> bool:
+    """True if TEM achieves sufficient entropy reduction OR hits the absolute floor."""
     red = relative_ent_reduction(S_base, S_tem)
-
     if np.isfinite(red) and red >= TEM_MIN_RELATIVE_ENT_REDUCTION:
         return True
-
     if np.isfinite(S_tem) and S_tem <= TEM_ABSOLUTE_ENT_THRESHOLD:
         return True
-
     return False
 
 
-def tem_propagation_ok(
-    *,
-    I_new: float,
-    I_prev: float,
-    S_base: float,
-    S_tem: float,
-) -> bool:
+def tem_propagation_ok(*, I_new: float, I_prev: float, S_base: float, S_tem: float) -> bool:
+    """True if the propagated TEM pulse passes both infidelity and entanglement tests."""
     if not np.isfinite(I_new):
         return False
-
     if I_new > TEM_PROPAGATE_INF_THRESHOLD:
         return False
-
     if np.isfinite(I_prev):
         if log10_infid(I_new) > log10_infid(I_prev) + TEM_MAX_LOG10_WORSENING:
             return False
-
     return tem_entanglement_ok(S_base=S_base, S_tem=S_tem)
 
 
@@ -501,28 +380,32 @@ def tem_propagation_ok(
 # Selection helpers within one grid point
 # ============================================================
 
-def select_best_baseline(local_results: list[tuple[int, dict[str, Any]]]) -> tuple[int, dict[str, Any]] | None:
+def select_best_baseline(
+    local_results: list[tuple[int, dict[str, Any]]]
+) -> tuple[int, dict[str, Any]] | None:
+    """Return the (slot, result) with the lowest finite infidelity, or None."""
     valid = [(k, r) for k, r in local_results if np.isfinite(r["final_infid"])]
     if not valid:
         return None
     return min(valid, key=lambda kr: kr[1]["final_infid"])
 
 
-def select_best_tem(local_results: list[tuple[int, dict[str, Any]]]) -> tuple[int, dict[str, Any]] | None:
+def select_best_tem(
+    local_results: list[tuple[int, dict[str, Any]]]
+) -> tuple[int, dict[str, Any]] | None:
+    """Return the best TEM result: prefer low entropy among successful runs."""
     successful = [
         (k, r) for k, r in local_results
         if np.isfinite(r["final_infid"])
         and r["final_infid"] <= INFIDELITY_THRESHOLD
         and np.isfinite(r["ent_avg"])
     ]
-
     if successful:
         return min(successful, key=lambda kr: kr[1]["ent_avg"])
-
+    # Fall back to lowest infidelity if none succeeded.
     valid = [(k, r) for k, r in local_results if np.isfinite(r["final_infid"])]
     if not valid:
         return None
-
     return min(valid, key=lambda kr: kr[1]["final_infid"])
 
 
@@ -531,6 +414,7 @@ def select_best_tem(local_results: list[tuple[int, dict[str, Any]]]) -> tuple[in
 # ============================================================
 
 def initialise_arrays() -> dict[str, Any]:
+    """Allocate NaN/False-filled output arrays for the full (theta, T, slot) grid."""
     n_theta = len(THETAS)
     n_T = len(DURATIONS_NS)
     shape = (n_theta, n_T, N_INIT_SLOTS)
@@ -565,7 +449,7 @@ def initialise_arrays() -> dict[str, Any]:
         n_time_steps_used=np.full((n_theta, n_T), N_TIME_STEPS, dtype=int),
         segment_duration_ns=np.full((n_theta, n_T), np.nan),
 
-        # Extra metadata. Old plotting scripts should ignore these.
+        # Propagation metadata (ignored by plotting scripts that don't know about it).
         baseline_used_propagated_init=np.zeros(shape, dtype=bool),
         ent_used_propagated_init=np.zeros(shape, dtype=bool),
         ent_used_primal_dual=np.zeros(shape, dtype=bool),
@@ -582,6 +466,7 @@ def initialise_arrays() -> dict[str, Any]:
         ent_relative_reduction=np.full(shape, np.nan),
     )
 
+    # Pre-fill static grid metadata (fixed step count for SQE).
     for i in range(n_theta):
         for j, T_ns in enumerate(DURATIONS_NS):
             arrays["n_time_steps_used"][i, j] = N_TIME_STEPS
@@ -591,17 +476,11 @@ def initialise_arrays() -> dict[str, Any]:
 
 
 def store_baseline_result(
-    arrays: dict[str, Any],
-    *,
-    i: int,
-    j: int,
-    k: int,
-    seed: int,
-    j_init_mean: float,
-    result: dict[str, Any],
-    used_propagated: bool,
-    parent_theta_idx: int = -1,
+    arrays: dict[str, Any], *, i: int, j: int, k: int,
+    seed: int, j_init_mean: float, result: dict[str, Any],
+    used_propagated: bool, parent_theta_idx: int = -1,
 ) -> None:
+    """Write a baseline run into arrays at grid point (i, j, k)."""
     arrays["baseline_successes"][i, j, k] = result["success"]
     arrays["baseline_optimization_successes"][i, j, k] = result["optimization_success"]
     arrays["baseline_final_infids"][i, j, k] = result["final_infid"]
@@ -618,18 +497,12 @@ def store_baseline_result(
 
 
 def store_tem_result(
-    arrays: dict[str, Any],
-    *,
-    i: int,
-    j: int,
-    k: int,
-    seed: int,
-    j_init_mean: float,
-    result: dict[str, Any],
-    used_propagated: bool,
-    parent_theta_idx: int = -1,
+    arrays: dict[str, Any], *, i: int, j: int, k: int,
+    seed: int, j_init_mean: float, result: dict[str, Any],
+    used_propagated: bool, parent_theta_idx: int = -1,
     S_base: float = np.nan,
 ) -> None:
+    """Write a TEM run into arrays at grid point (i, j, k)."""
     arrays["ent_successes"][i, j, k] = result["success"]
     arrays["ent_optimization_successes"][i, j, k] = result["optimization_success"]
     arrays["ent_final_infids"][i, j, k] = result["final_infid"]
@@ -644,10 +517,13 @@ def store_tem_result(
     arrays["ent_used_propagated_init"][i, j, k] = used_propagated
     arrays["ent_parent_theta_idx"][i, j] = parent_theta_idx
     arrays["ent_used_primal_dual"][i, j, k] = bool(result.get("used_primal_dual", False))
-    arrays["ent_relative_reduction"][i, j, k] = relative_ent_reduction(S_base, result["ent_avg"])
+    arrays["ent_relative_reduction"][i, j, k] = relative_ent_reduction(
+        S_base, result["ent_avg"]
+    )
 
 
 def save_raw(arrays: dict[str, Any]) -> None:
+    """Save the current state of all arrays to the output .npz file."""
     np.savez_compressed(
         RAW_OUT,
         thetas=THETAS,
@@ -698,20 +574,22 @@ def save_raw(arrays: dict[str, Any]) -> None:
 
 
 # ============================================================
-# Row worker
+# Row worker: scans theta for one fixed duration
 # ============================================================
 
 def run_one_duration_row(task: tuple[Any, ...]) -> dict[str, Any]:
-    (
-        j,
-        T_ns,
-        seed_row,
-        base_config,
-    ) = task
+    """
+    Process one full theta sweep at a fixed duration T_ns.
 
+    Returns a dict with keys 'j', 'T_ns', 'arrays' (the full initialised-array
+    structure, written only for column j and returned to the main process for
+    merging via merge_row).
+    """
+    j, T_ns, seed_row, base_config = task
     rng = np.random.default_rng(int(seed_row))
     arrays = initialise_arrays()
 
+    # Propagation state: track accepted pulses and their infidelities.
     prev_baseline_x: np.ndarray | None = None
     prev_baseline_I: float = np.nan
     prev_baseline_theta_idx: int = -1
@@ -721,75 +599,51 @@ def run_one_duration_row(task: tuple[Any, ...]) -> dict[str, Any]:
     prev_tem_theta_idx: int = -1
 
     for i, theta in enumerate(THETAS):
-        # ----------------------------------------------------
-        # Baseline
-        # ----------------------------------------------------
+        # ------------------------------------------------
+        # Baseline (infidelity-only) scan for this theta
+        # ------------------------------------------------
         baseline_results: list[tuple[int, dict[str, Any]]] = []
         baseline_prop_accepted = False
 
         if i >= N_BOOTSTRAP_THETAS and prev_baseline_x is not None:
+            # Try propagated warm-start.
             prop_result = run_baseline_once(
-                base_config=base_config,
-                theta=float(theta),
-                T_ns=float(T_ns),
-                seed=None,
-                j_init_mean=0.0,
-                x0=prev_baseline_x,
+                base_config=base_config, theta=float(theta), T_ns=float(T_ns),
+                seed=None, j_init_mean=0.0, x0=prev_baseline_x,
             )
-
             store_baseline_result(
-                arrays,
-                i=i,
-                j=j,
-                k=PROP_SLOT,
-                seed=-1,
-                j_init_mean=np.nan,
-                result=prop_result,
-                used_propagated=True,
+                arrays, i=i, j=j, k=PROP_SLOT, seed=-1, j_init_mean=np.nan,
+                result=prop_result, used_propagated=True,
                 parent_theta_idx=prev_baseline_theta_idx,
             )
             baseline_results.append((PROP_SLOT, prop_result))
 
             baseline_prop_accepted = baseline_propagation_ok(
-                I_new=prop_result["final_infid"],
-                I_prev=prev_baseline_I,
+                I_new=prop_result["final_infid"], I_prev=prev_baseline_I,
             )
             arrays["baseline_propagation_accepted"][i, j] = baseline_prop_accepted
 
-        run_baseline_randoms = (
+        # Run random initialisations if needed.
+        run_randoms = (
             i < N_BOOTSTRAP_THETAS
             or not baseline_prop_accepted
             or not SKIP_RANDOM_IF_BASELINE_PROP_ACCEPTED
         )
 
-        if run_baseline_randoms:
+        if run_randoms:
             for r in range(N_RANDOM_INITS):
                 k = r if i < N_BOOTSTRAP_THETAS else RANDOM_SLOT0 + r
                 if k >= N_INIT_SLOTS:
                     continue
-
                 seed = int(rng.integers(0, 2**31 - 1))
                 j_mean = float(J_INIT_MEANS[r % len(J_INIT_MEANS)])
-
                 res = run_baseline_once(
-                    base_config=base_config,
-                    theta=float(theta),
-                    T_ns=float(T_ns),
-                    seed=seed,
-                    j_init_mean=j_mean,
-                    x0=None,
+                    base_config=base_config, theta=float(theta), T_ns=float(T_ns),
+                    seed=seed, j_init_mean=j_mean, x0=None,
                 )
-
                 store_baseline_result(
-                    arrays,
-                    i=i,
-                    j=j,
-                    k=k,
-                    seed=seed,
-                    j_init_mean=j_mean,
-                    result=res,
-                    used_propagated=False,
-                    parent_theta_idx=-1,
+                    arrays, i=i, j=j, k=k, seed=seed, j_init_mean=j_mean,
+                    result=res, used_propagated=False,
                 )
                 baseline_results.append((k, res))
 
@@ -804,64 +658,46 @@ def run_one_duration_row(task: tuple[Any, ...]) -> dict[str, Any]:
             prev_baseline_theta_idx = i
             selected_baseline_S = float(r_sel["ent_avg"])
 
-        # ----------------------------------------------------
-        # TEM
-        # ----------------------------------------------------
+        # ------------------------------------------------
+        # TEM (entropy-penalised) scan for this theta
+        # ------------------------------------------------
         tem_results: list[tuple[int, dict[str, Any]]] = []
         tem_prop_accepted = False
 
         if i >= N_BOOTSTRAP_THETAS and prev_tem_x is not None:
-            # First: infidelity-only repair from propagated TEM pulse.
+            # Step 1: infidelity-only repair using the propagated TEM pulse.
             repair_result = run_tem_once(
-                base_config=base_config,
-                theta=float(theta),
-                T_ns=float(T_ns),
-                seed=None,
-                j_init_mean=0.0,
-                x0=prev_tem_x,
+                base_config=base_config, theta=float(theta), T_ns=float(T_ns),
+                seed=None, j_init_mean=0.0, x0=prev_tem_x,
                 entanglement_optimisation=False,
             )
 
             repair_ok = tem_propagation_ok(
-                I_new=repair_result["final_infid"],
-                I_prev=prev_tem_I,
-                S_base=selected_baseline_S,
-                S_tem=repair_result["ent_avg"],
+                I_new=repair_result["final_infid"], I_prev=prev_tem_I,
+                S_base=selected_baseline_S, S_tem=repair_result["ent_avg"],
             )
 
             if repair_ok:
                 prop_result = repair_result
             else:
-                # Second: primal-dual from repaired pulse.
+                # Step 2: constrained (primal-dual) run from repaired pulse.
                 prop_result = run_tem_once(
-                    base_config=base_config,
-                    theta=float(theta),
-                    T_ns=float(T_ns),
-                    seed=None,
-                    j_init_mean=0.0,
+                    base_config=base_config, theta=float(theta), T_ns=float(T_ns),
+                    seed=None, j_init_mean=0.0,
                     x0=np.asarray(repair_result["x_final"], dtype=float),
                     entanglement_optimisation=True,
                 )
 
             store_tem_result(
-                arrays,
-                i=i,
-                j=j,
-                k=PROP_SLOT,
-                seed=-1,
-                j_init_mean=np.nan,
-                result=prop_result,
-                used_propagated=True,
-                parent_theta_idx=prev_tem_theta_idx,
-                S_base=selected_baseline_S,
+                arrays, i=i, j=j, k=PROP_SLOT, seed=-1, j_init_mean=np.nan,
+                result=prop_result, used_propagated=True,
+                parent_theta_idx=prev_tem_theta_idx, S_base=selected_baseline_S,
             )
             tem_results.append((PROP_SLOT, prop_result))
 
             tem_prop_accepted = tem_propagation_ok(
-                I_new=prop_result["final_infid"],
-                I_prev=prev_tem_I,
-                S_base=selected_baseline_S,
-                S_tem=prop_result["ent_avg"],
+                I_new=prop_result["final_infid"], I_prev=prev_tem_I,
+                S_base=selected_baseline_S, S_tem=prop_result["ent_avg"],
             )
             arrays["ent_propagation_accepted"][i, j] = tem_prop_accepted
 
@@ -876,31 +712,16 @@ def run_one_duration_row(task: tuple[Any, ...]) -> dict[str, Any]:
                 k = r if i < N_BOOTSTRAP_THETAS else RANDOM_SLOT0 + r
                 if k >= N_INIT_SLOTS:
                     continue
-
                 seed = int(rng.integers(0, 2**31 - 1))
                 j_mean = float(J_INIT_MEANS[r % len(J_INIT_MEANS)])
-
                 res = run_tem_once(
-                    base_config=base_config,
-                    theta=float(theta),
-                    T_ns=float(T_ns),
-                    seed=seed,
-                    j_init_mean=j_mean,
-                    x0=None,
+                    base_config=base_config, theta=float(theta), T_ns=float(T_ns),
+                    seed=seed, j_init_mean=j_mean, x0=None,
                     entanglement_optimisation=True,
                 )
-
                 store_tem_result(
-                    arrays,
-                    i=i,
-                    j=j,
-                    k=k,
-                    seed=seed,
-                    j_init_mean=j_mean,
-                    result=res,
-                    used_propagated=False,
-                    parent_theta_idx=-1,
-                    S_base=selected_baseline_S,
+                    arrays, i=i, j=j, k=k, seed=seed, j_init_mean=j_mean,
+                    result=res, used_propagated=False, S_base=selected_baseline_S,
                 )
                 tem_results.append((k, res))
 
@@ -910,29 +731,27 @@ def run_one_duration_row(task: tuple[Any, ...]) -> dict[str, Any]:
             k_sel, r_sel = selected_tem
             arrays["ent_selected_slot"][i, j] = k_sel
 
-            # Only propagate accepted TEM pulses:
-            # successful infidelity plus entanglement condition.
+            # Only propagate if the pulse is both low-infidelity and low-entropy.
             if (
                 np.isfinite(r_sel["final_infid"])
                 and r_sel["final_infid"] <= TEM_PROPAGATE_INF_THRESHOLD
-                and tem_entanglement_ok(S_base=selected_baseline_S, S_tem=r_sel["ent_avg"])
+                and tem_entanglement_ok(S_base=selected_baseline_S,
+                                        S_tem=r_sel["ent_avg"])
             ):
                 prev_tem_x = np.asarray(r_sel["x_final"], dtype=float)
                 prev_tem_I = float(r_sel["final_infid"])
                 prev_tem_theta_idx = i
             else:
+                # Reset propagation chain on failure.
                 prev_tem_x = None
                 prev_tem_I = np.nan
                 prev_tem_theta_idx = -1
 
-    return dict(
-        j=j,
-        T_ns=T_ns,
-        arrays=arrays,
-    )
+    return dict(j=j, T_ns=T_ns, arrays=arrays)
 
 
 def merge_row(global_arrays: dict[str, Any], row_out: dict[str, Any]) -> None:
+    """Merge column j of the row-worker's arrays into the global arrays."""
     j = int(row_out["j"])
     row_arrays = row_out["arrays"]
 
@@ -948,39 +767,37 @@ def merge_row(global_arrays: dict[str, Any], row_out: dict[str, Any]) -> None:
 # ============================================================
 
 def main() -> None:
+    """Build the full row-propagated pulse database using a multiprocessing pool."""
     base_config = make_base_config()
     arrays = initialise_arrays()
 
     if CONFIG_X0_FIELD is None:
         print("=" * 72)
-        print("WARNING")
-        print("No explicit initial-pulse field was detected in SimulationConfig.")
-        print("Propagation will fail unless you add the correct field name to:")
-        print("    CONFIG_X0_FIELD_CANDIDATES")
+        print("WARNING: No initial-pulse field found in SimulationConfig.")
+        print("Propagation will fail.  Add the field name to CONFIG_X0_FIELD_CANDIDATES.")
         print("=" * 72)
     else:
-        print(f"Using SimulationConfig field for propagated initial pulse: {CONFIG_X0_FIELD}")
+        print(f"Propagated initial pulse uses SimulationConfig field: {CONFIG_X0_FIELD!r}")
 
     rng = np.random.default_rng(SEED0)
-    tasks = []
 
-    for j, T_ns in enumerate(DURATIONS_NS):
-        seed_row = int(rng.integers(0, 2**31 - 1))
-        tasks.append((j, float(T_ns), seed_row, base_config))
+    # One task per duration column; each worker scans all thetas for that T.
+    tasks = [
+        (j, float(T_ns), int(rng.integers(0, 2**31 - 1)), base_config)
+        for j, T_ns in enumerate(DURATIONS_NS)
+    ]
 
     print("=" * 72)
-    print("Generating SQE-gate row-propagated pulse database")
-    print(f"Output = {RAW_OUT}")
-    print(f"Pulse family label = {PULSE_FAMILY_LABEL}")
-    print(f"J_min = {BASE_CONFIG_KWARGS['J_min']}")
-    print(f"J_max = {BASE_CONFIG_KWARGS['J_max']}")
-    print(f"N theta = {len(THETAS)}")
-    print(f"N durations = {len(DURATIONS_NS)}")
-    print(f"N random inits = {N_RANDOM_INITS}")
-    print(f"N init slots saved = {N_INIT_SLOTS}")
-    print(f"N time steps = {N_TIME_STEPS}")
-    print(f"N bootstrap theta values = {N_BOOTSTRAP_THETAS}")
-    print(f"Total duration-row jobs = {len(tasks)}")
+    print("Generating SQE-gate row-propagated pulse database (positiveJ)")
+    print(f"Output     = {RAW_OUT}")
+    print(f"J_min/max  = {BASE_CONFIG_KWARGS['J_min']} / {BASE_CONFIG_KWARGS['J_max']} MHz")
+    print(f"N theta    = {len(THETAS)}")
+    print(f"N duration = {len(DURATIONS_NS)}")
+    print(f"N rnd init = {N_RANDOM_INITS}")
+    print(f"N slots    = {N_INIT_SLOTS}")
+    print(f"N steps    = {N_TIME_STEPS}")
+    print(f"Bootstrap  = {N_BOOTSTRAP_THETAS} thetas")
+    print(f"N rows     = {len(tasks)}")
     print("=" * 72)
 
     completed_rows = 0
@@ -988,13 +805,8 @@ def main() -> None:
     with mp.Pool(processes=N_WORKERS) as pool:
         iterator = pool.imap_unordered(run_one_duration_row, tasks, chunksize=1)
 
-        for row_out in tqdm(
-            iterator,
-            total=len(tasks),
-            desc="duration rows",
-            unit="row",
-            dynamic_ncols=True,
-        ):
+        for row_out in tqdm(iterator, total=len(tasks), desc="duration rows",
+                             unit="row", dynamic_ncols=True):
             merge_row(arrays, row_out)
             completed_rows += 1
 
@@ -1002,9 +814,7 @@ def main() -> None:
                 save_raw(arrays)
 
     save_raw(arrays)
-
-    print("\nDone.")
-    print(f"Saved row-propagated pulse database to:\n  {RAW_OUT}")
+    print(f"\nDone.  Saved to:\n  {RAW_OUT}")
 
 
 if __name__ == "__main__":

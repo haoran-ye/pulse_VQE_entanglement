@@ -1,27 +1,42 @@
 """
-Double Qubit Excitation (DQE) optimization for 4-spin systems.
+Double Qubit Excitation (DQE) state optimization for 4-spin systems.
 
-Optimizes piecewise-constant exchange coupling pulses (3 channels for a
-nearest-neighbor chain) to implement a target DQE gate — a rotation in the
-|0011⟩ ↔ |1100⟩ subspace — while optionally minimizing multipartite
-entanglement via primal-dual methods.
+Physics
+-------
+A 4-spin nearest-neighbor chain (semiconductor spin qubits) is driven by three
+piecewise-constant exchange couplings J₁₂(t), J₂₃(t), J₃₄(t).  The target
+operation is the DQE gate: a rotation by theta_target in the {|0011⟩, |1100⟩}
+subspace, acting as identity everywhere else.
 
-entanglement_optimisation flag
+The system is built in the rotating frame of the average Zeeman splitting, which
+removes free precession and leaves only the relative detunings deltaB = B − mean(B)
+in the drift Hamiltonian.  The frame unitary U_rot dresses the target state.
+
+Algorithm
+---------
+entanglement_optimisation = False
+    Minimize state infidelity I = ⟨ψ(T)|I − |ψ_target⟩⟨ψ_target||ψ(T)⟩ via
+    L-BFGS-B using QuGrad autodiff gradients.
+
+entanglement_optimisation = True
+    1. Run the baseline (infidelity-only) optimisation to convergence.
+    2. Run the entropy-constrained primal-dual loop from the same x0.
+    Baseline stored in results.baseline for comparison.
+
+Entanglement cost (primal-dual)
 -------------------------------
-False : Minimize state infidelity only (uses QuGrad autodiff gradient).
-True  : First minimize infidelity, then run the entropy-constrained primal-dual
-        loop from the same x0; baseline result stored in results.baseline.
+    cost(x) = mean_t( (Σ_P S_P(t) − S_max)₊² )
 
-Frame transformation
+where the sum runs over all 7 distinct bipartite partitions of 4 qubits
+(ALL_BIPARTITIONS_4Q: four single-qubit cuts + three two-qubit cuts), S_P(t)
+is the von Neumann entropy for partition P, and (·)₊ = max(0, ·).
+
+Augmented Lagrangian
 --------------------
-The system is constructed in the rotating frame of the average Zeeman splitting,
-while the infidelity observable is constructed in the frame of each qubit.
+    L(x, λ) = cost(x) + λ(I(x) − ε) + (ρ/2)(I(x) − ε)²
 
-Entanglement cost
------------------
-The cost function is the mean-squared violation of a cap on the *sum* of von
-Neumann entropies over all seven distinct bipartite partitions of 4 qubits
-(four single-qubit cuts + three two-qubit cuts).  Controlled by config.S_max.
+Dual update after each inner solve:
+    λ ← max(0, λ + α(I − ε))
 """
 from __future__ import annotations
 
@@ -65,20 +80,27 @@ def basis_state(n_qubits: int, bitstring: str) -> np.ndarray:
 
 def _make_system_and_observable(config: SimulationConfig):
     """
-    Build the rotating-frame SpinChain and the infidelity observable.
+    Build the 4-spin SpinChain in the rotating frame and the infidelity observable.
 
-    The system is constructed in the rotating frame of the average Zeeman
-    splitting; the observable is constructed in the frame of each qubit.
+    Returns
+    -------
+    sys : SpinChain
+        4-spin system; drift uses deltaB (relative detunings); drive disabled.
+    observable : ndarray, shape (16, 16)
+        I − |ψ_target⟩⟨ψ_target|.  Its expectation value equals the state infidelity.
     """
+    # Build rotating frame: deltaB = B − mean(B); U_rot = expm(−iπ H_frame T·1e-3)
     deltaB, U_rot = make_rotating_frame(config.zeeman_splittings, config.T)
 
+    # Target state in the rotating frame: apply DQE gate, then dress with U_rot
     target_state = U_rot @ dqe_unitary(config.theta_target) @ config.initial_state
+    # Projector onto the complement of |ψ_target⟩ in the 16-dimensional Hilbert space
     observable   = np.eye(16, dtype=np.complex128) - np.outer(target_state, target_state.conj())
 
     sys = SpinChain(
         spins=4,
         zeeman_splittings=deltaB,
-        max_drive_strength=0.0,
+        max_drive_strength=0.0,           # no microwave drive in this experiment
         J_max=config.J_max,
         J_min=config.J_min,
         feromagnetic=config.feromagnetic,
@@ -91,23 +113,27 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
     """
     Create a driven system with piecewise-constant interpolation.
 
-    The J channels are packed as x.reshape(n_time_steps, n_J_channels) on the
-    coarse grid and repeated n_discretisation times to obtain the fine grid.
+    x is a flat vector of length n_time_steps × n_J_channels (= 3 for DQE).
+    It is reshaped to (n_time_steps, 3) on the coarse grid, then each row is
+    repeated n_discretisation times to obtain the fine-grid pulse tensor.
     """
     n_steps    = config.n_time_steps
     n_disc     = config.n_discretisation
     n_fine     = n_steps * n_disc
+    # T is in ns; multiply by 1e-3 to convert to µs for qugradlab, then × 2π for rad/µs
     dt_fine_us = (config.T / n_fine) * NS_TO_US
 
     def pulse_function(x):
+        # Pack x into (n_steps, 3) coarse grid — one row per time step, 3 J channels
         x_coarse = tf.reshape(convert_dtype(x), (n_steps, config.n_J_channels))
+        # Repeat each coarse step n_disc times → piecewise-constant fine grid
         x_fine   = tf.repeat(x_coarse, repeats=n_disc, axis=0)
         return (
-            convert_dtype(np.zeros((n_fine, 4))),    # drive amplitudes (disabled)
-            tf.zeros(4, dtype=tf.complex128),        # drive frequencies
-            x_fine,                                  # J-channel amplitudes
-            convert_dtype(config.initial_state),     # initial state
-            dt_fine_us * 2 * np.pi,                  # timestep (rad/µs)
+            convert_dtype(np.zeros((n_fine, 4))),    # drive amplitudes (4 spins, disabled)
+            tf.zeros(4, dtype=tf.complex128),        # drive frequencies (zero; rotating frame)
+            x_fine,                                  # J-channel amplitudes on fine grid
+            convert_dtype(config.initial_state),     # |ψ₀⟩ (16-dim)
+            dt_fine_us * 2 * np.pi,                  # timestep in rad/µs
         )
 
     return sys.pulse_form(pulse_function)
@@ -172,18 +198,23 @@ def _lagrangian_and_grad(driven_sys, x, *, observable, lam, S_max, fd_eps,
     """
     Augmented Lagrangian value and gradient.
 
-    Objective: L = S_cost + λ(I − ε) + (ρ/2)(I − ε)²
+    L(x, λ) = cost(x) + λ·c + (ρ/2)·c²,  c = I(x) − ε
 
-    where S_cost is the mean-squared multipartite entanglement violation and
-    I is the state infidelity (the constraint I ≤ ε is enforced via λ).
+    where cost is the mean-squared multipartite entanglement hinge violation
+    (primary objective), I is the state infidelity (constraint I ≤ ε via λ),
+    and c is the constraint residual.
+
+    Gradient: ∇L = ∇cost + (λ + ρ·c)·∇I
     """
+    # Entanglement cost: sum of entropies over all 7 bipartitions; FD gradient
     S  = _cost_entropy(driven_sys, x, S_max=S_max)
     gS = _entropy_grad_fd(driven_sys, x, S_max=S_max, eps=fd_eps)
 
+    # Infidelity and autodiff gradient from QuGrad
     infidelity, grad_inf = driven_sys.gradient(x, observable)
-    infidelity = max(0.0, float(np.real(infidelity)))   # guard against float64 cancellation
+    infidelity = max(0.0, float(np.real(infidelity)))   # guard numerical noise from complex arithmetic
     grad_inf   = np.asarray(grad_inf, float)
-    c = infidelity - eps_infidelity
+    c = infidelity - eps_infidelity                      # constraint residual I − ε
 
     L  = S + lam * c + 0.5 * rho * c ** 2
     gL = gS + (lam + rho * c) * grad_inf
@@ -224,6 +255,7 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds,
         S          = _cost_entropy(driven_sys, x, S_max=float(config.S_max))
         infidelity = np.real(driven_sys.gradient(x, observable)[0])
         c          = infidelity - float(config.eps_infidelity)
+        # Dual ascent: λ ← max(0, λ + α(I−ε)); max(0,·) is the KKT projection
         lam        = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({

@@ -3,17 +3,31 @@ Plotting functions for gate-based optimization results.
 
 SQE gate layout (plot_sqe_gate_optimisation)
 --------------------------------------------
-Panel 0 : Control pulse
+Panel 0 : Control pulse J(t) in physical units (MHz)
 Panel 1 : Gate infidelity evolution (log scale)
 Panel 2 : Main gate entanglement measure (config.gate_ent_measure)
-Panel 3+ : One panel per measure in config.extra_ent_measures
+Panel 3+: One panel per measure in config.extra_ent_measures
 
 DQE gate layout (plot_dqe_gate_optimisation)
 --------------------------------------------
-Panels 0-2 : Control pulses for J₁₂, J₂₃, J₃₄ (one per subplot)
+Panels 0-2 : Control pulses J₁₂, J₂₃, J₃₄ (one per subplot)
 Panel  3   : Gate infidelity evolution (log scale)
 Panel  4   : Main gate entanglement measure (config.gate_ent_measure)
 Panel  5+  : One panel per measure in config.extra_ent_measures
+
+Color convention
+----------------
+Blue  (#1f77b4) : initial (unoptimized) trajectory
+Green (#2ca02c) : infidelity-only optimized (I-optimised)
+Red   (#d62728) : entropy-constrained optimized (EP-optimised)
+Black (dashed)  : target value
+
+Target lines
+------------
+Target lines are drawn only for deterministic gate measures
+(GATE_MEASURE_DETERMINISTIC = True).  Monte Carlo-based measures such as
+"average_entangling_power" and "max_output_entanglement" are skipped at
+plot time because re-evaluation is too slow.
 """
 from __future__ import annotations
 
@@ -53,6 +67,7 @@ COLOR_TARGET         = 'black'
 
 
 def _rescale_J(x, J_min, J_max):
+    # Affine map from optimiser range [-1, 1] to physical J range [J_min, J_max] MHz
     return 0.5 * (J_max - J_min) * x + 0.5 * (J_max + J_min)
 
 
@@ -144,7 +159,7 @@ def plot_entanglement_evolution_gate(results: SQEGateResults, ax=None, *,
     t = _fine_time(config)
     is_main = (measure_name == config.gate_ent_measure)
 
-    # Retrieve trajectories: main measure stored directly; extras in dict
+    # The main measure is stored directly on the result; extra measures in a dict
     def _get_traj(res, final: bool):
         if is_main:
             return res.ent_final if final else res.ent_initial
@@ -160,7 +175,8 @@ def plot_entanglement_evolution_gate(results: SQEGateResults, ax=None, *,
     label, color = _run_label_color(config.entanglement_optimisation)
     ax.plot(t, _get_traj(results, True), label=label, color=color, zorder=4)
 
-    # Target line (only for deterministic measures — MC measures are too slow at plot time)
+    # Deterministic measures can be evaluated quickly at plot time for a target line.
+    # MC-based measures (average_entangling_power etc.) are skipped — too slow.
     if GATE_MEASURE_DETERMINISTIC.get(measure_name, False):
         target_gate = single_qubit_excitation(config.theta_target)
         target_value = GATE_MEASURES[measure_name](target_gate)
@@ -297,6 +313,7 @@ def plot_entanglement_evolution_dqe_gate(results: DQEGateResults, ax=None, *,
     t = _fine_time(config)
     is_main = (measure_name == config.gate_ent_measure)
 
+    # The main measure is stored directly on the result; extra measures in a dict
     def _get_traj(res, final: bool):
         if is_main:
             return res.ent_final if final else res.ent_initial
@@ -312,6 +329,8 @@ def plot_entanglement_evolution_dqe_gate(results: DQEGateResults, ax=None, *,
     label, color = _run_label_color(config.entanglement_optimisation)
     ax.plot(t, _get_traj(results, True), label=label, color=color, zorder=4)
 
+    # Deterministic measures can be evaluated quickly at plot time for a target line.
+    # MC-based measures (average_entangling_power etc.) are skipped — too slow.
     if GATE_MEASURE_DETERMINISTIC.get(measure_name, False):
         target_gate = dqe_unitary(config.theta_target)
         target_value = GATE_MEASURES[measure_name](target_gate)

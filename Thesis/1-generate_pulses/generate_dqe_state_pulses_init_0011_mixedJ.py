@@ -1,78 +1,99 @@
 #!/usr/bin/env python3
 """
-generate_dqe_state_pulses_init_0011_positiveJ.py
+generate_dqe_state_pulses_init_0011_mixedJ.py
 
-Generate a reusable DQE-state pulse database starting from |0011>.
+Build the raw DQE-state pulse database starting from |0011⟩ using mixed exchange
+coupling (J ∈ [−5, 5] MHz) on all three channels (J₁₂, J₂₃, J₃₄).
 
-This script saves EVERY run/init and does NO selection.
+Unlike the positiveJ variant, the number of time steps is adaptive: short
+durations use fewer segments (down to 1 ns per segment) so we don't waste
+parameters on very short pulses.  The maximum is MAX_N_TIME_STEPS = 50.
 
-Output:
-    PULSES_DATABASE/dqe_state_initstate_0011_positiveJ_pulses.npz
+P3 fix — state_ent_measure
+--------------------------
+"linear" has no effect in the DQE optimiser; "von_neumann" is correct.
 
-Pulse-array convention:
-    baseline_x_final/the ent_x_final have shape
-        (n_theta, n_duration, n_init, max_n_pulse_params)
+B6 fix — update_arrays
+-----------------------
+The original mixedJ script did NOT update n_time_steps_used or segment_duration_ns
+in update_arrays (the positiveJ script did).  Both are now written from the worker
+result so the saved .npz accurately records the adaptive step count used.
 
-    For DQE state:
-        n_J_channels = 3
-        max_n_pulse_params = MAX_N_TIME_STEPS * n_J_channels
+Output array shape convention
+------------------------------
+    baseline_x_final, ent_x_final : (n_theta, n_duration, n_init, MAX_N_PULSE_PARAMS)
+    where MAX_N_PULSE_PARAMS = MAX_N_TIME_STEPS * N_J_CHANNELS = 150
+    Entries beyond n_time_steps_used[i,j] * N_J_CHANNELS are NaN (unused).
+    All scalar diagnostic arrays   : (n_theta, n_duration, n_init)
 
-    For grid point (i_theta, i_T), the valid pulse slice is
-        : n_time_steps_used[i_theta, i_T] * n_J_channels
+Output
+------
+    PULSES_DATABASE/dqe_state_initstate_0011_mixedJ_pulses.npz
 """
 
 from __future__ import annotations
 
-import sys
 import multiprocessing as mp
 from pathlib import Path
-from dataclasses import replace, fields, is_dataclass
 from typing import Any
 
 import numpy as np
 from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parents[3]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# pulse_vqe_entanglement is not pip-installed; add the repo root to sys.path.
+import sys as _sys
+_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+del _sys, _ROOT
 
 from pulse_vqe_entanglement.dataclasses import SimulationConfig
 from pulse_vqe_entanglement.dqe_state import dqe_optimisation, basis_state
-from pulse_vqe_entanglement.entanglement_measures import entropy_sum_traj
+
+# Shared helpers: config manipulation, result extraction.
+from thesis_utils import (
+    filter_kwargs_for_config,
+    safe_replace_config,
+    extract_state_result_arrays,
+    fixed_width_x,
+    nanmean_safe,
+    nanmax_safe,
+)
 
 
 # ============================================================
 # Settings
 # ============================================================
 
-PULSES_DATABASE = Path(
-    "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE"
-)
+# B1: resolved relative to this file so the script works on any machine.
+PULSES_DATABASE = Path(__file__).resolve().parent.parent / "PULSES_DATABASE"
 
 SYSTEM_NAME = "dqe_state"
 INITIAL_STATE_LABEL = "initstate_0011"
-J_SETTINGS = "mixedJ"  # "positiveJ" or "mixedJ", remember to change J_MIN/J_MAX.
+J_SETTINGS = "mixedJ"
 
 OUTDIR = PULSES_DATABASE
 OUTDIR.mkdir(parents=True, exist_ok=True)
+
 RAW_OUT = OUTDIR / f"{SYSTEM_NAME}_{INITIAL_STATE_LABEL}_{J_SETTINGS}_pulses.npz"
 
 THETAS = np.linspace(0.0 * np.pi, 0.50 * np.pi, 15)
-DURATIONS_NS = np.arange(1.0, 1200.0, 80.0)
+DURATIONS_NS = np.arange(1.0, 1200.0, 80.0)   # coarser grid than SQE
 
-N_INITS = 1
-N_WORKERS = 9
-SEED0 = 1234
-CHECKPOINT_EVERY = 100
+N_INITS = 1           # random initialisations per grid point
+N_WORKERS = 9         # parallel worker processes
+SEED0 = 1234          # master RNG seed for reproducibility
+CHECKPOINT_EVERY = 100  # save checkpoint every N completed jobs
 
-INFIDELITY_THRESHOLD = 1e-5
-INFIDELITY_FLOOR = 1e-14
+INFIDELITY_THRESHOLD = 1e-5   # success criterion for a single run
+INFIDELITY_FLOOR = 1e-14      # clip near-zero infidelities
 
-MAX_N_TIME_STEPS = 50
-MIN_SEGMENT_DURATION_NS = 1.0
-N_J_CHANNELS = 3
-MAX_N_PULSE_PARAMS = MAX_N_TIME_STEPS * N_J_CHANNELS
+MAX_N_TIME_STEPS = 50             # cap on piecewise-constant segments
+MIN_SEGMENT_DURATION_NS = 1.0    # floor on segment length (ns)
+N_J_CHANNELS = 3                  # J₁₂, J₂₃, J₃₄
+MAX_N_PULSE_PARAMS = MAX_N_TIME_STEPS * N_J_CHANNELS  # = 150
 
+# Augmented Lagrangian / TEM optimiser hyperparameters.
 N_OUTER = 3
 INNER_MAXITER = 200
 EPS_INFIDELITY = 1e-12
@@ -80,22 +101,21 @@ DUAL_LR = 1e10
 RHO = 0.0
 FD_EPS = 1e-6
 
+# Fixed S_max for the entanglement constraint.
 ENTANGLEMENT_CAP = 0.1
 
-J_INIT_MEANS = np.array(
-    [0.0] * (N_INITS // 2)
-    + [0.0] * (N_INITS - N_INITS // 2),
-    dtype=float,
-)
+# B4: was [0.0]*(N//2) + [0.0]*(N-N//2) which always gives zeros.
+J_INIT_MEANS = np.zeros(N_INITS, dtype=float)
 
-ZEEMAN = np.array([1000.0, 1008.0, 1016.0, 1024.0])
-INITIAL_STATE = basis_state(4, "0011")
+ZEEMAN = np.array([1000.0, 1008.0, 1016.0, 1024.0])  # MHz, 4-spin chain
+INITIAL_STATE = basis_state(4, "0011")                # |0011⟩ ∈ ℂ^16
 
+# P3 fix: state_ent_measure="von_neumann" (not "linear" which has no effect in DQE).
 BASE_CONFIG_KWARGS: dict[str, Any] = dict(
     zeeman_splittings=ZEEMAN,
     initial_state=INITIAL_STATE,
     theta_target=0.0,
-    n_time_steps=50,
+    n_time_steps=MAX_N_TIME_STEPS,   # overridden per-job by n_time_steps_for_duration
     n_discretisation=1,
     T=200.0,
     max_drive_strength=0.0,
@@ -108,7 +128,7 @@ BASE_CONFIG_KWARGS: dict[str, Any] = dict(
     maxiter=200,
     entanglement_optimisation=False,
     optimisation_target="state",
-    state_ent_measure="linear",
+    state_ent_measure="von_neumann",   # P3 fix: was "linear" which is not implemented
     J_init_seed=None,
     S_max=ENTANGLEMENT_CAP,
     eps_infidelity=EPS_INFIDELITY,
@@ -121,113 +141,16 @@ BASE_CONFIG_KWARGS: dict[str, Any] = dict(
 )
 
 
-# ============================================================
-# Helpers
-# ============================================================
-
-def dataclass_field_names(cls: type) -> set[str]:
-    if not is_dataclass(cls):
-        return set()
-    return {f.name for f in fields(cls)}
-
-
-CONFIG_FIELDS = dataclass_field_names(SimulationConfig)
-
-
-def filter_kwargs_for_config(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in kwargs.items() if k in CONFIG_FIELDS}
-
-
 def make_base_config() -> SimulationConfig:
+    """Construct the base SimulationConfig, dropping any unknown kwargs."""
     return SimulationConfig(**filter_kwargs_for_config(BASE_CONFIG_KWARGS))
 
 
-def safe_replace_config(config: SimulationConfig, **kwargs: Any) -> SimulationConfig:
-    return replace(config, **filter_kwargs_for_config(kwargs))
-
-
-def get_attr_any(obj: Any, names: list[str], default: Any = None) -> Any:
-    for name in names:
-        if hasattr(obj, name):
-            return getattr(obj, name)
-    return default
-
-
-def as_1d_float_array(x: Any) -> np.ndarray:
-    if x is None:
-        return np.array([], dtype=float)
-    return np.asarray(x, dtype=float).reshape(-1)
-
-
-def fixed_width_x(x: Any, width: int) -> np.ndarray:
-    out = np.full(width, np.nan, dtype=float)
-    if x is None:
-        return out
-
-    arr = np.asarray(x, dtype=float).reshape(-1)
-    n = min(width, arr.size)
-    out[:n] = arr[:n]
-    return out
-
-
 def n_time_steps_for_duration(T_ns: float) -> int:
+    """Adaptive step count: at most MAX_N_TIME_STEPS, at least 1 ns per segment."""
     return max(
         1,
         min(MAX_N_TIME_STEPS, int(np.floor(T_ns / MIN_SEGMENT_DURATION_NS))),
-    )
-
-
-def average_entropy(entropies: np.ndarray) -> float:
-    entropies = as_1d_float_array(entropies)
-    if entropies.size == 0 or np.all(~np.isfinite(entropies)):
-        return np.nan
-    return float(np.nanmean(entropies))
-
-
-def max_entropy(entropies: np.ndarray) -> float:
-    entropies = as_1d_float_array(entropies)
-    if entropies.size == 0 or np.all(~np.isfinite(entropies)):
-        return np.nan
-    return float(np.nanmax(entropies))
-
-
-def extract_result_arrays(result: Any) -> dict[str, Any]:
-    infidelities = as_1d_float_array(
-        get_attr_any(
-            result,
-            ["infidelities", "infidelity_evolution", "state_infidelities", "val_final"],
-        )
-    )
-
-    final_infid = get_attr_any(
-        result,
-        ["final_infidelity", "best_infidelity"],
-        default=None,
-    )
-    if final_infid is None:
-        final_infid = float(infidelities[-1]) if infidelities.size else np.nan
-
-    entropies = as_1d_float_array(
-        get_attr_any(
-            result,
-            ["entropies", "entropy_evolution", "entropy_sum", "S_evolution", "S_values"],
-        )
-    )
-
-    if entropies.size == 0:
-        final_traj = get_attr_any(result, ["final_traj"])
-        if final_traj is not None:
-            entropies = entropy_sum_traj(np.asarray(final_traj))
-
-    return dict(
-        infidelities=infidelities,
-        entropies=entropies,
-        x0=get_attr_any(result, ["x0", "x_initial", "initial_x"]),
-        x_final=get_attr_any(result, ["x_final", "x_opt", "x", "optimised_x", "optimized_x"]),
-        final_infid=float(final_infid),
-        n_iterations=get_attr_any(result, ["n_iterations", "nit", "iterations"], default=np.nan),
-        gradient_norm=get_attr_any(result, ["gradient_norm", "grad_norm"], default=np.nan),
-        optimization_success=bool(get_attr_any(result, ["optimization_success", "success"], default=False)),
     )
 
 
@@ -236,6 +159,12 @@ def extract_result_arrays(result: Any) -> dict[str, Any]:
 # ============================================================
 
 def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
+    """
+    Run one (theta, duration, init) grid point and return results as a flat dict.
+
+    E2 fix: dqe_optimisation with entanglement_optimisation=True runs the
+    infidelity-only baseline internally; we read from ent_result.baseline.
+    """
     (
         i_theta,
         i_T,
@@ -247,6 +176,7 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
         base_config,
     ) = task
 
+    # Adaptive step count: short pulses get fewer segments.
     n_steps = n_time_steps_for_duration(T_ns)
 
     common_kwargs = dict(
@@ -265,21 +195,13 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
         n_J_channels=N_J_CHANNELS,
     )
 
-    baseline_config = safe_replace_config(
-        base_config,
-        **common_kwargs,
-        entanglement_optimisation=False,
-    )
-    baseline_result = dqe_optimisation(baseline_config)
-    baseline_arrays = extract_result_arrays(baseline_result)
-
-    ent_config = safe_replace_config(
-        base_config,
-        **common_kwargs,
-        entanglement_optimisation=True,
-    )
+    # E2: one call only — baseline is stored in ent_result.baseline.
+    ent_config = safe_replace_config(base_config, **common_kwargs,
+                                     entanglement_optimisation=True)
     ent_result = dqe_optimisation(ent_config)
-    ent_arrays = extract_result_arrays(ent_result)
+
+    baseline_arrays = extract_state_result_arrays(ent_result.baseline)
+    ent_arrays = extract_state_result_arrays(ent_result)
 
     baseline_final_infid = max(float(baseline_arrays["final_infid"]), INFIDELITY_FLOOR)
     ent_final_infid = max(float(ent_arrays["final_infid"]), INFIDELITY_FLOOR)
@@ -293,21 +215,24 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
         n_time_steps=n_steps,
         segment_duration_ns=T_ns / n_steps,
 
-        baseline_success=np.isfinite(baseline_final_infid) and baseline_final_infid <= INFIDELITY_THRESHOLD,
+        baseline_success=(np.isfinite(baseline_final_infid)
+                          and baseline_final_infid <= INFIDELITY_THRESHOLD),
         baseline_optimization_success=baseline_arrays["optimization_success"],
         baseline_final_infid=baseline_final_infid,
-        baseline_s_avg=average_entropy(baseline_arrays["entropies"]),
-        baseline_s_max=max_entropy(baseline_arrays["entropies"]),
+        baseline_s_avg=nanmean_safe(baseline_arrays["entropies"]),
+        baseline_s_max=nanmax_safe(baseline_arrays["entropies"]),
+        # NaN-pad to MAX width so all runs have the same pulse-array shape.
         baseline_x0=fixed_width_x(baseline_arrays["x0"], MAX_N_PULSE_PARAMS),
         baseline_x_final=fixed_width_x(baseline_arrays["x_final"], MAX_N_PULSE_PARAMS),
         baseline_n_iterations=baseline_arrays["n_iterations"],
         baseline_gradient_norm=baseline_arrays["gradient_norm"],
 
-        ent_success=np.isfinite(ent_final_infid) and ent_final_infid <= INFIDELITY_THRESHOLD,
+        ent_success=(np.isfinite(ent_final_infid)
+                     and ent_final_infid <= INFIDELITY_THRESHOLD),
         ent_optimization_success=ent_arrays["optimization_success"],
         ent_final_infid=ent_final_infid,
-        ent_s_avg=average_entropy(ent_arrays["entropies"]),
-        ent_s_max=max_entropy(ent_arrays["entropies"]),
+        ent_s_avg=nanmean_safe(ent_arrays["entropies"]),
+        ent_s_max=nanmax_safe(ent_arrays["entropies"]),
         ent_x0=fixed_width_x(ent_arrays["x0"], MAX_N_PULSE_PARAMS),
         ent_x_final=fixed_width_x(ent_arrays["x_final"], MAX_N_PULSE_PARAMS),
         ent_n_iterations=ent_arrays["n_iterations"],
@@ -316,15 +241,16 @@ def run_one_seed(task: tuple[Any, ...]) -> dict[str, Any]:
 
 
 # ============================================================
-# Saving
+# Array management
 # ============================================================
 
 def initialise_arrays() -> dict[str, Any]:
+    """Allocate NaN/False-filled output arrays for the full grid."""
     n_theta = len(THETAS)
     n_T = len(DURATIONS_NS)
     shape = (n_theta, n_T, N_INITS)
 
-    arrays: dict[str, Any] = dict(
+    return dict(
         baseline_successes=np.zeros(shape, dtype=bool),
         ent_successes=np.zeros(shape, dtype=bool),
         baseline_optimization_successes=np.zeros(shape, dtype=bool),
@@ -351,14 +277,53 @@ def initialise_arrays() -> dict[str, Any]:
         seeds=np.full(shape, -1, dtype=np.int64),
         J_init_means=np.full(shape, np.nan),
 
+        # -1 sentinel = not yet computed (adaptive, so varies by grid point).
         n_time_steps_used=np.full((n_theta, n_T), -1, dtype=int),
         segment_duration_ns=np.full((n_theta, n_T), np.nan),
     )
 
-    return arrays
+
+def update_arrays(arrays: dict[str, Any], out: dict[str, Any]) -> None:
+    """Write a single worker result into the global arrays at (i, j, k).
+
+    B6 fix: n_time_steps_used and segment_duration_ns are now updated here
+    (they were missing in the original mixedJ version, unlike positiveJ).
+    """
+    i, j, k = out["i_theta"], out["i_T"], out["k_init"]
+
+    arrays["baseline_successes"][i, j, k] = out["baseline_success"]
+    arrays["ent_successes"][i, j, k] = out["ent_success"]
+    arrays["baseline_optimization_successes"][i, j, k] = out["baseline_optimization_success"]
+    arrays["ent_optimization_successes"][i, j, k] = out["ent_optimization_success"]
+
+    arrays["baseline_final_infids"][i, j, k] = out["baseline_final_infid"]
+    arrays["ent_final_infids"][i, j, k] = out["ent_final_infid"]
+
+    arrays["baseline_s_avg"][i, j, k] = out["baseline_s_avg"]
+    arrays["ent_s_avg"][i, j, k] = out["ent_s_avg"]
+    arrays["baseline_s_max"][i, j, k] = out["baseline_s_max"]
+    arrays["ent_s_max"][i, j, k] = out["ent_s_max"]
+
+    arrays["baseline_x0"][i, j, k] = out["baseline_x0"]
+    arrays["ent_x0"][i, j, k] = out["ent_x0"]
+    arrays["baseline_x_final"][i, j, k] = out["baseline_x_final"]
+    arrays["ent_x_final"][i, j, k] = out["ent_x_final"]
+
+    arrays["baseline_n_iterations"][i, j, k] = out["baseline_n_iterations"]
+    arrays["ent_n_iterations"][i, j, k] = out["ent_n_iterations"]
+    arrays["baseline_gradient_norms"][i, j, k] = out["baseline_gradient_norm"]
+    arrays["ent_gradient_norms"][i, j, k] = out["ent_gradient_norm"]
+
+    arrays["seeds"][i, j, k] = out["seed"]
+    arrays["J_init_means"][i, j, k] = out["J_init_mean"]
+
+    # B6 fix: record adaptive step count per (i, j) — was missing in original.
+    arrays["n_time_steps_used"][i, j] = out["n_time_steps"]
+    arrays["segment_duration_ns"][i, j] = out["segment_duration_ns"]
 
 
 def save_raw(arrays: dict[str, Any]) -> None:
+    """Save the current state of all arrays to the output .npz file."""
     np.savez_compressed(
         RAW_OUT,
         thetas=THETAS,
@@ -397,49 +362,19 @@ def save_raw(arrays: dict[str, Any]) -> None:
     )
 
 
-def update_arrays(arrays: dict[str, Any], out: dict[str, Any]) -> None:
-    i = out["i_theta"]
-    j = out["i_T"]
-    k = out["k_init"]
-
-    arrays["baseline_successes"][i, j, k] = out["baseline_success"]
-    arrays["ent_successes"][i, j, k] = out["ent_success"]
-    arrays["baseline_optimization_successes"][i, j, k] = out["baseline_optimization_success"]
-    arrays["ent_optimization_successes"][i, j, k] = out["ent_optimization_success"]
-
-    arrays["baseline_final_infids"][i, j, k] = out["baseline_final_infid"]
-    arrays["ent_final_infids"][i, j, k] = out["ent_final_infid"]
-
-    arrays["baseline_s_avg"][i, j, k] = out["baseline_s_avg"]
-    arrays["ent_s_avg"][i, j, k] = out["ent_s_avg"]
-    arrays["baseline_s_max"][i, j, k] = out["baseline_s_max"]
-    arrays["ent_s_max"][i, j, k] = out["ent_s_max"]
-
-    arrays["baseline_x0"][i, j, k] = out["baseline_x0"]
-    arrays["ent_x0"][i, j, k] = out["ent_x0"]
-    arrays["baseline_x_final"][i, j, k] = out["baseline_x_final"]
-    arrays["ent_x_final"][i, j, k] = out["ent_x_final"]
-
-    arrays["baseline_n_iterations"][i, j, k] = out["baseline_n_iterations"]
-    arrays["ent_n_iterations"][i, j, k] = out["ent_n_iterations"]
-    arrays["baseline_gradient_norms"][i, j, k] = out["baseline_gradient_norm"]
-    arrays["ent_gradient_norms"][i, j, k] = out["ent_gradient_norm"]
-
-    arrays["seeds"][i, j, k] = out["seed"]
-    arrays["J_init_means"][i, j, k] = out["J_init_mean"]
-
-
 # ============================================================
 # Main
 # ============================================================
 
 def main() -> None:
+    """Build the full pulse database in parallel using a multiprocessing pool."""
     base_config = make_base_config()
     arrays = initialise_arrays()
 
     rng = np.random.default_rng(SEED0)
     tasks = []
 
+    # Pre-compute adaptive step counts and fill grid metadata before dispatch.
     for i, theta in enumerate(THETAS):
         for j, T_ns in enumerate(DURATIONS_NS):
             n_steps = n_time_steps_for_duration(float(T_ns))
@@ -449,29 +384,22 @@ def main() -> None:
             seed_list = rng.integers(0, 2**31 - 1, size=N_INITS, dtype=np.int64)
 
             for k in range(N_INITS):
-                tasks.append(
-                    (
-                        i,
-                        j,
-                        k,
-                        float(theta),
-                        float(T_ns),
-                        int(seed_list[k]),
-                        float(J_INIT_MEANS[k % len(J_INIT_MEANS)]),
-                        base_config,
-                    )
-                )
+                tasks.append((
+                    i, j, k,
+                    float(theta), float(T_ns),
+                    int(seed_list[k]),
+                    float(J_INIT_MEANS[k % len(J_INIT_MEANS)]),
+                    base_config,
+                ))
 
     print("=" * 72)
-    print("Generating DQE-state raw pulse database")
-    print(f"Output = {RAW_OUT}")
-    print(f"Initial state label = {INITIAL_STATE_LABEL}")
-    print("Initial state = |0011>")
-    print(f"N theta = {len(THETAS)}")
-    print(f"N durations = {len(DURATIONS_NS)}")
-    print(f"N inits per point = {N_INITS}")
-    print(f"N J channels = {N_J_CHANNELS}")
-    print(f"Total seed jobs = {len(tasks)}")
+    print("Generating DQE-state pulse database (|0011⟩ initial state, mixedJ)")
+    print(f"Output     = {RAW_OUT}")
+    print(f"N theta    = {len(THETAS)}")
+    print(f"N duration = {len(DURATIONS_NS)}")
+    print(f"N inits    = {N_INITS}")
+    print(f"N channels = {N_J_CHANNELS}")
+    print(f"N jobs     = {len(tasks)}")
     print("=" * 72)
 
     chunksize = max(1, len(tasks) // (N_WORKERS * 20))
@@ -480,7 +408,8 @@ def main() -> None:
         iterator = pool.imap_unordered(run_one_seed, tasks, chunksize=chunksize)
 
         for n_done, out in enumerate(
-            tqdm(iterator, total=len(tasks), desc="DQE-state pulse jobs", unit="job", dynamic_ncols=True),
+            tqdm(iterator, total=len(tasks), desc="DQE-state |0011⟩ mixedJ jobs",
+                 unit="job", dynamic_ncols=True),
             start=1,
         ):
             update_arrays(arrays, out)
@@ -489,9 +418,7 @@ def main() -> None:
                 save_raw(arrays)
 
     save_raw(arrays)
-
-    print("\nDone.")
-    print(f"Saved raw all-init pulse database to:\n  {RAW_OUT}")
+    print(f"\nDone.  Saved to:\n  {RAW_OUT}")
 
 
 if __name__ == "__main__":

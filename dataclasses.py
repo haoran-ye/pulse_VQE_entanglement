@@ -29,52 +29,59 @@ NoiseType = Literal["none", "dephasing", "depolarising"]
 
 @dataclass
 class SimulationConfig:
-    zeeman_splittings: np.ndarray
-    initial_state: Optional[np.ndarray] = None
-    theta_target: float = 0.25 * np.pi
+    # ---- Physical system ----
+    zeeman_splittings: np.ndarray           # Larmor frequencies per spin (MHz)
+    initial_state: Optional[np.ndarray] = None   # Hilbert-space state vector (or ρ₀ for noise)
+    theta_target: float = 0.25 * np.pi     # Target rotation angle (radians)
 
-    n_time_steps: int = 100
-    n_discretisation: int = 1
-    T: float = 1000.0
+    # ---- Time and discretisation ----
+    n_time_steps: int = 100                # Coarse-grid points (one parameter per J channel)
+    n_discretisation: int = 1             # Sub-steps per coarse point; n_fine = n_steps × n_disc
+    T: float = 1000.0                     # Total gate time (ns)
 
+    # ---- Microwave drive (disabled in J-only experiments) ----
     max_drive_strength: float = 0.0
     drive_init_scale: float = 0.0
     drive_seed: Optional[int] = None
 
-    J_max: float = 10.0
-    J_min: float = 0.0
-    J_init_scale: float = 1e-3
-    J_init_mean: float = 0.0
-    J_init_seed: Optional[int] = None
-    feromagnetic: bool = False
+    # ---- Exchange coupling (J) bounds and initialisation ----
+    J_max: float = 10.0                   # Physical upper bound (MHz); optimiser works in [-1, 1]
+    J_min: float = 0.0                    # Physical lower bound (MHz)
+    J_init_scale: float = 1e-3            # Amplitude of random perturbation from J_init_mean
+    J_init_mean: float = 0.0             # Centre of initial parameter range in [-1, 1]
+    J_init_seed: Optional[int] = None    # RNG seed for reproducible initialisation
+    feromagnetic: bool = False            # Sign convention for J (note: intentional library spelling)
 
-    x0_override: np.ndarray | None = None    
-    
-    gtol: float = 1e-12
-    maxiter: int = 200
-    entanglement_optimisation: bool = False
+    x0_override: np.ndarray | None = None   # Skip random init and use this vector directly
+
+    # ---- Baseline optimisation settings ----
+    gtol: float = 1e-12                  # L-BFGS-B gradient norm convergence threshold
+    maxiter: int = 200                   # Max iterations for the baseline (infidelity-only) run
+    entanglement_optimisation: bool = False  # If True: run primal-dual entropy loop after baseline
     optimisation_target: OptimisationTarget = "state"
 
-    # Optional Lindblad noise evaluation
-    noise_type: NoiseType = "none"
-    noise_rate: float = 0.0
+    # ---- Lindblad noise (sqe_state_noise only; post-hoc evaluation) ----
+    noise_type: NoiseType = "none"       # "none", "dephasing", or "depolarising"
+    noise_rate: float = 0.0             # Lindblad collapse rate γ (same units as frequencies, MHz)
 
-    S_max: float = 0.05
-    eps_infidelity: float = 1e-8
-    rho: float = 10.0
-    dual_lr: float = 1e4
-    n_outer: int = 20
-    inner_maxiter: int = 200
-    fd_eps: float = 1e-5
+    # ---- Augmented Lagrangian / primal-dual hyperparameters ----
+    S_max: float = 0.05                  # Entanglement cap (bits for state; gate measure units for gate)
+    eps_infidelity: float = 1e-8         # Infidelity tolerance ε; constraint is I ≤ ε
+    rho: float = 10.0                    # Penalty coefficient for the augmented term (ρ/2)(I−ε)²
+    dual_lr: float = 1e4                 # Dual variable update step size α; λ ← max(0, λ + α(I−ε))
+    n_outer: int = 20                    # Number of outer primal-dual iterations
+    inner_maxiter: int = 200             # L-BFGS-B iterations per inner Lagrangian minimisation
+    fd_eps: float = 1e-5                 # Finite-difference step size for entropy gradient
 
-    state_ent_measure: str = "von_neumann"
-    gate_ent_measure: str = "operator_entanglement"
-    extra_ent_measures: list = field(default_factory=list)
+    # ---- Entanglement measure selection ----
+    state_ent_measure: str = "von_neumann"         # Key in STATE_MEASURES registry
+    gate_ent_measure: str = "operator_entanglement"  # Key in GATE_MEASURES registry
+    extra_ent_measures: list = field(default_factory=list)  # Extra measure names to pre-compute and plot
 
-    entropy_subsystem: Optional[Sequence[int]] = None
-    n_J_channels: int = 1
+    entropy_subsystem: Optional[Sequence[int]] = None  # Bipartition subsystem A (DQE; unused if None)
+    n_J_channels: int = 1               # Set automatically by each optimiser: 1 (SQE) or 3 (DQE)
 
-    dqe_plot_partitions: list = field(default_factory=list)
+    dqe_plot_partitions: list = field(default_factory=list)  # Extra bipartitions to add to DQE plots
 
 
 @dataclass

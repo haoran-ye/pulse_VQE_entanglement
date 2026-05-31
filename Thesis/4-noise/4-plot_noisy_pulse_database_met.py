@@ -1,13 +1,33 @@
 #!/usr/bin/env python3
 """
-plot_noisy_pulse_database_met.py
+4-plot_noisy_pulse_database_met.py
+
+Evaluate baseline and TEM pulses under Lindblad noise and plot the noisy
+infidelity maps.
+
+Steps
+-----
+  1. Load a raw pulse database (.npz).
+  2. Infer the system type (SQE/DQE, state/gate).
+  3. Select the best pulse at each (theta, T) for both baseline and TEM.
+  4. Simulate each selected pulse under T1/T2 noise using qugradlab.
+  5. Plot a three-panel map (baseline | TEM | improvement ratio).
+
+Physics note — gate_infidelity
+------------------------------
+  The process fidelity between superoperators S_target and S_expt is:
+      F_avg = (Re[Tr(S_target† S_expt)] + d) / (d(d + 1))
+  where d is the PHYSICAL dimension (not the superoperator dimension d²).
+  The gate infidelity is 1 − F_avg.  (P4 fix)
+
+  Reference: Nielsen, Phys. Lett. A 303 (2002) 249–252.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -18,10 +38,10 @@ from tqdm import tqdm
 
 from qugradlab.systems.semiconducting.esr import SpinChain
 
+# B2 fix: pulse_vqe_entanglement is pip-installed; no sys.path hack needed.
+# Update: sys.path needed for this
 
-ROOT = Path(__file__).resolve().parents[3]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 
 from pulse_vqe_entanglement.dataclasses import NS_TO_US
 from pulse_vqe_entanglement.sqe_state import single_qubit_excitation
@@ -32,10 +52,9 @@ from pulse_vqe_entanglement.dqe_state import dqe_unitary, basis_state
 # User settings
 # =============================================================================
 
-INPUT_FILE = Path(
-    "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE/"
-    "dqe_gate_positiveJ_rowprop_pulses.npz"
-)
+# B1 fix: INPUT_FILE resolved relative to this script.
+PULSES_DATABASE = Path(__file__).resolve().parent.parent / "PULSES_DATABASE"
+INPUT_FILE = PULSES_DATABASE / "dqe_gate_positiveJ_pulses.npz"
 
 OUTDIR = Path(__file__).resolve().parent
 OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -45,8 +64,8 @@ PLOT_PREFIX = INPUT_FILE.stem
 N_WORKERS = 9
 CHECKPOINT_EVERY_PRINT = 50
 
-T1_US = 1.0e6
-T2_US = 1.0e3
+T1_US = 1.0e6  # T1 relaxation time (µs)
+T2_US = 1.0e3  # T2 dephasing time (µs)
 
 INFID_FLOOR = 1e-16
 CLEAN_INF_THRESHOLD = 1e-5
@@ -67,17 +86,21 @@ X = np.array([[0, 1], [1, 0]], dtype=np.complex128)
 Y = np.array([[0, -1j], [1j, 0]], dtype=np.complex128)
 Z = np.array([[1, 0], [0, -1]], dtype=np.complex128)
 
+# B7 fix: renamed to SIGMA_MINUS to match the physical role (lowering/de-excitation
+# jump operator for T1 relaxation).  Same matrix [[0,1],[0,0]] as before.
 SIGMA_MINUS = np.array([[0, 1], [0, 0]], dtype=np.complex128)
 
 
-def op_on_qubit(op, q, n):
+def op_on_qubit(op: np.ndarray, q: int, n: int) -> np.ndarray:
+    """Embed a single-qubit operator *op* on qubit *q* in an *n*-qubit space."""
     out = np.array([[1.0]], dtype=np.complex128)
     for i in range(n):
         out = np.kron(out, op if i == q else I2)
     return out
 
 
-def z_ops(n):
+def z_ops(n: int) -> list[np.ndarray]:
+    """List of single-qubit Z operators on each qubit in an n-qubit system."""
     return [op_on_qubit(Z, q, n) for q in range(n)]
 
 
@@ -85,21 +108,21 @@ def z_ops(n):
 # Database helpers
 # =============================================================================
 
-def scalar_str(x):
+def scalar_str(x) -> str:
     arr = np.asarray(x)
-    if arr.shape == ():
-        return str(arr.item())
-    return str(x)
+    return str(arr.item()) if arr.shape == () else str(x)
 
 
-def get_array(data, *names):
+def get_array(data, *names: str) -> np.ndarray:
+    """Return the first of *names* found in *data.files*."""
     for name in names:
         if name in data.files:
             return data[name]
     raise KeyError(f"None of these arrays found: {names}")
 
 
-def infer_system_name(data, input_file):
+def infer_system_name(data, input_file: Path) -> str:
+    """Read system_name from the database or infer it from the filename."""
     if "system_name" in data.files:
         return scalar_str(data["system_name"])
 
@@ -114,32 +137,30 @@ def infer_system_name(data, input_file):
         return "dqe_state"
 
     raise ValueError(
-        "Could not infer system_name. Store system_name in the database or "
+        "Could not infer system_name.  Store system_name in the database or "
         "use a filename containing sqe/dqe and state/gate."
     )
 
 
-def infer_excitation_and_target(system_name):
+def infer_excitation_and_target(system_name: str) -> tuple[str, str]:
+    """Parse system_name into (excitation, target_kind)."""
     s = system_name.lower()
-
     if "sqe" in s:
         excitation = "sqe"
     elif "dqe" in s:
         excitation = "dqe"
     else:
         raise ValueError(f"Could not infer excitation from system_name={system_name!r}")
-
     if "state" in s:
         target_kind = "state"
     elif "gate" in s:
         target_kind = "gate"
     else:
         raise ValueError(f"Could not infer target kind from system_name={system_name!r}")
-
     return excitation, target_kind
 
 
-def infer_n_spins(excitation, zeeman):
+def infer_n_spins(excitation: str, zeeman: np.ndarray) -> int:
     if excitation == "sqe":
         return 2
     if excitation == "dqe":
@@ -147,59 +168,56 @@ def infer_n_spins(excitation, zeeman):
     return len(zeeman)
 
 
-def infer_n_J_channels(excitation, data, pulse_width, max_n_time_steps):
+def infer_n_J_channels(excitation: str, data, pulse_width: int, max_n_time_steps: int) -> int:
+    """Read n_J_channels from database, infer from pulse width, or use defaults."""
     if "n_J_channels" in data.files:
         return int(data["n_J_channels"])
-
     if max_n_time_steps > 0 and pulse_width % max_n_time_steps == 0:
         n_channels = pulse_width // max_n_time_steps
         if n_channels >= 1:
             return int(n_channels)
-
     if excitation == "sqe":
         return 1
     if excitation == "dqe":
         return 3
-
     raise ValueError("Could not infer n_J_channels.")
 
 
-def infer_initial_state(data, excitation, target_kind, n_spins):
+def infer_initial_state(data, excitation: str, target_kind: str, n_spins: int) -> np.ndarray:
+    """Return the initial state for state targets, or |0…0⟩ for gate targets."""
     if target_kind == "state":
         if "initial_state" in data.files:
             return np.asarray(data["initial_state"], dtype=np.complex128)
-
         if excitation == "dqe":
             return basis_state(4, "0011")
-
         raise KeyError("State target requires initial_state in database.")
-
     dim = 2 ** n_spins
     psi = np.zeros(dim, dtype=np.complex128)
     psi[0] = 1.0
     return psi
 
 
-def get_entanglement_array(data, label, target_kind):
+def get_entanglement_array(data, label: str, target_kind: str) -> np.ndarray:
+    """Return the appropriate entanglement array (state or gate, avg or max)."""
     if target_kind == "state":
         if label == "baseline":
-            if ENTANGLEMENT_STAT == "avg":
-                return get_array(data, "baseline_s_avg", "baseline_s_max")
-            return get_array(data, "baseline_s_max", "baseline_s_avg")
+            return (get_array(data, "baseline_s_avg", "baseline_s_max")
+                    if ENTANGLEMENT_STAT == "avg"
+                    else get_array(data, "baseline_s_max", "baseline_s_avg"))
         if label == "ent":
-            if ENTANGLEMENT_STAT == "avg":
-                return get_array(data, "ent_s_avg", "ent_s_max")
-            return get_array(data, "ent_s_max", "ent_s_avg")
+            return (get_array(data, "ent_s_avg", "ent_s_max")
+                    if ENTANGLEMENT_STAT == "avg"
+                    else get_array(data, "ent_s_max", "ent_s_avg"))
 
     if target_kind == "gate":
         if label == "baseline":
-            if ENTANGLEMENT_STAT == "avg":
-                return get_array(data, "baseline_ent_avg", "baseline_ent_max")
-            return get_array(data, "baseline_ent_max", "baseline_ent_avg")
+            return (get_array(data, "baseline_ent_avg", "baseline_ent_max")
+                    if ENTANGLEMENT_STAT == "avg"
+                    else get_array(data, "baseline_ent_max", "baseline_ent_avg"))
         if label == "ent":
-            if ENTANGLEMENT_STAT == "avg":
-                return get_array(data, "ent_ent_avg", "ent_ent_max")
-            return get_array(data, "ent_ent_max", "ent_ent_avg")
+            return (get_array(data, "ent_ent_avg", "ent_ent_max")
+                    if ENTANGLEMENT_STAT == "avg"
+                    else get_array(data, "ent_ent_max", "ent_ent_avg"))
 
     raise ValueError((label, target_kind))
 
@@ -208,9 +226,13 @@ def get_entanglement_array(data, label, target_kind):
 # Local selection only
 # =============================================================================
 
-def select_baseline_local(data):
-    infids = get_array(data, "baseline_final_infids")
+def select_baseline_local(data) -> np.ndarray:
+    """
+    For each (theta, T), return the init index with the lowest finite infidelity.
 
+    Returns index array with -1 where no finite infidelity exists.
+    """
+    infids = get_array(data, "baseline_final_infids")
     n_theta, n_T, _ = infids.shape
     seed_idx = np.full((n_theta, n_T), -1, dtype=int)
 
@@ -219,14 +241,22 @@ def select_baseline_local(data):
             finite = np.isfinite(infids[i, j])
             if not np.any(finite):
                 continue
-
             idx = np.where(finite)[0]
             seed_idx[i, j] = idx[np.nanargmin(infids[i, j, finite])]
 
     return seed_idx
 
 
-def select_ent_local(data, target_kind, threshold):
+def select_ent_local(data, target_kind: str, threshold: float):
+    """
+    For each (theta, T), select the TEM init: lowest-entanglement successful run,
+    or lowest-infidelity run if none succeed.
+
+    Returns
+    -------
+    seed_idx : (n_theta, n_T), -1 where no finite value found.
+    selected_successful : (n_theta, n_T) bool.
+    """
     infids = get_array(data, "ent_final_infids")
     ent_values = get_entanglement_array(data, "ent", target_kind)
 
@@ -249,12 +279,12 @@ def select_ent_local(data, target_kind, threshold):
                     continue
                 idx = np.where(finite_I)[0]
                 seed_idx[i, j] = idx[np.nanargmin(infids[i, j, finite_I])]
-                selected_successful[i, j] = False
 
     return seed_idx, selected_successful
 
 
-def gather_selected_scalar_local(arr, seed_idx):
+def gather_selected_scalar_local(arr: np.ndarray, seed_idx: np.ndarray) -> np.ndarray:
+    """Gather the scalar value at the selected init index for each (theta, T)."""
     out = np.full(seed_idx.shape, np.nan)
     for i in range(seed_idx.shape[0]):
         for j in range(seed_idx.shape[1]):
@@ -264,7 +294,10 @@ def gather_selected_scalar_local(arr, seed_idx):
     return out
 
 
-def get_pulse_local(pulse_array, i, j, seed, n_steps, n_J_channels):
+def get_pulse_local(
+    pulse_array: np.ndarray, i: int, j: int, seed: int, n_steps: int, n_J_channels: int
+) -> np.ndarray | None:
+    """Extract the active portion of a stored pulse vector at (i, j, seed)."""
     if seed < 0:
         return None
     width = int(n_steps) * int(n_J_channels)
@@ -275,31 +308,35 @@ def get_pulse_local(pulse_array, i, j, seed, n_steps, n_J_channels):
 # Targets
 # =============================================================================
 
-def free_rotating_unitary(zeeman, T_ns, n_spins):
+def free_rotating_unitary(zeeman: np.ndarray, T_ns: float, n_spins: int) -> np.ndarray:
+    """Free-rotation unitary in the rotating frame for duration T_ns."""
     deltaB = zeeman - np.mean(zeeman)
     H_rot = sum(deltaB[q] * z_ops(n_spins)[q] for q in range(n_spins))
     return expm(-1j * np.pi * H_rot * T_ns * NS_TO_US)
 
 
-def target_unitary(excitation, theta, T_ns, zeeman):
+def target_unitary(excitation: str, theta: float, T_ns: float, zeeman: np.ndarray) -> np.ndarray:
+    """Full target unitary including free rotation in the rotating frame."""
     n_spins = infer_n_spins(excitation, zeeman)
-
     if excitation == "sqe":
         U_exc = single_qubit_excitation(theta)
     elif excitation == "dqe":
         U_exc = dqe_unitary(theta)
     else:
         raise ValueError(excitation)
-
     return free_rotating_unitary(zeeman, T_ns, n_spins) @ U_exc
 
 
-def target_rho(excitation, theta, T_ns, zeeman, initial_state):
+def target_rho(excitation: str, theta: float, T_ns: float, zeeman: np.ndarray,
+               initial_state: np.ndarray) -> np.ndarray:
+    """Target density matrix for state fidelity calculations."""
     psi = target_unitary(excitation, theta, T_ns, zeeman) @ initial_state
     return np.outer(psi, psi.conj())
 
 
-def target_superoperator(excitation, theta, T_ns, zeeman):
+def target_superoperator(excitation: str, theta: float, T_ns: float,
+                         zeeman: np.ndarray) -> np.ndarray:
+    """Target superoperator S_U = U ⊗ U* for gate fidelity calculations."""
     U = target_unitary(excitation, theta, T_ns, zeeman)
     return np.kron(U, U.conj())
 
@@ -308,23 +345,29 @@ def target_superoperator(excitation, theta, T_ns, zeeman):
 # Noise and system construction
 # =============================================================================
 
-def lindblad_ops_T1_T2(n_spins, T1_us, T2_us):
+def lindblad_ops_T1_T2(n_spins: int, T1_us: float, T2_us: float) -> np.ndarray:
+    """
+    Lindblad jump operators for T1 relaxation and T2 pure dephasing.
+
+    T2 dephasing rate: γ_φ = 1/T2 - 1/(2T1)  (pure dephasing contribution).
+    """
     gamma_1 = 1.0 / T1_us
     gamma_phi = max(0.0, 1.0 / T2_us - 0.5 / T1_us)
 
     ops = []
-
     for q in range(n_spins):
+        # T1 relaxation: σ- jump operator on each qubit.
         ops.append(np.sqrt(gamma_1 / 4.0) * op_on_qubit(SIGMA_MINUS, q, n_spins))
-
     if gamma_phi > 0.0:
         for q in range(n_spins):
+            # Pure dephasing: Z jump operator on each qubit.
             ops.append(np.sqrt(gamma_phi / 4.0) * op_on_qubit(Z, q, n_spins))
 
     return np.asarray(ops, dtype=np.complex128)
 
 
-def drive_frequencies_for_pulse_form(excitation, zeeman):
+def drive_frequencies_for_pulse_form(excitation: str, zeeman: np.ndarray) -> np.ndarray:
+    """Drive frequencies: Zeeman splittings for SQE, zero for DQE."""
     if excitation == "sqe":
         return np.asarray(zeeman, dtype=np.float64)
     if excitation == "dqe":
@@ -334,19 +377,20 @@ def drive_frequencies_for_pulse_form(excitation, zeeman):
 
 def make_noisy_driven_system(
     *,
-    excitation,
-    target_kind,
-    T_ns,
-    n_steps,
-    n_discretisation,
-    n_spins,
-    n_J_channels,
-    zeeman,
-    initial_state,
-    J_min,
-    J_max,
-    L0,
+    excitation: str,
+    target_kind: str,
+    T_ns: float,
+    n_steps: int,
+    n_discretisation: int,
+    n_spins: int,
+    n_J_channels: int,
+    zeeman: np.ndarray,
+    initial_state: np.ndarray,
+    J_min: float,
+    J_max: float,
+    L0: np.ndarray,
 ):
+    """Build a qugradlab driven Lindblad system for one (theta, T) grid point."""
     deltaB = zeeman - np.mean(zeeman)
 
     sys_obj = SpinChain(
@@ -361,16 +405,13 @@ def make_noisy_driven_system(
 
     n_fine = int(n_steps) * int(n_discretisation)
     dt_fine_us = T_ns / n_fine * NS_TO_US
-
     drive_freqs = drive_frequencies_for_pulse_form(excitation, zeeman)
-
     rho0 = np.outer(initial_state, initial_state.conj())
 
     def pulse_function(x):
         x = tf.cast(tf.convert_to_tensor(x), tf.complex128)
         x = tf.reshape(x, (n_steps, n_J_channels))
         x = tf.repeat(x, repeats=n_discretisation, axis=0)
-
         return (
             tf.zeros((n_fine, n_spins), dtype=tf.complex128),
             tf.cast(tf.convert_to_tensor(drive_freqs), tf.complex128),
@@ -383,22 +424,44 @@ def make_noisy_driven_system(
 
 
 # =============================================================================
-# Infidelity
+# Infidelity metrics
 # =============================================================================
 
-def state_infidelity(rho, rho_target):
+def state_infidelity(rho: np.ndarray, rho_target: np.ndarray) -> float:
+    """1 - Tr(ρ ρ_target) for pure target state, clipped to INFID_FLOOR."""
     return max(1.0 - float(np.real(np.trace(rho @ rho_target))), INFID_FLOOR)
 
 
-def gate_infidelity(channel, target_channel):
-    d_super = channel.shape[0]
-    val = 1.0 - (
-        np.abs(np.trace(target_channel.conj().T @ channel)) ** 2 + d_super
-    ) / (d_super * (d_super + 1))
-    return max(float(np.real(val)), INFID_FLOOR)
+def gate_infidelity(channel: np.ndarray, target_channel: np.ndarray) -> float:
+    """
+    Average gate infidelity between superoperators *channel* and *target_channel*.
+
+    P4 fix: correct formula uses the PHYSICAL dimension d, not the superoperator
+    dimension d² = channel.shape[0].
+
+        F_avg = (Re[Tr(S_target† S_expt)] + d) / (d(d + 1))
+        I = max(1 - F_avg, INFID_FLOOR)
+
+    Reference: Nielsen (2002), Phys. Lett. A 303, 249–252.
+    """
+    d_super = channel.shape[0]           # superoperator dim = d² (e.g. 16 for 2 qubits)
+    d = int(np.round(np.sqrt(d_super)))  # physical Hilbert-space dimension (e.g. 4)
+    trace_val = float(np.real(np.trace(target_channel.conj().T @ channel)))
+    f_avg = (trace_val + d) / (d * (d + 1))
+    return max(float(1.0 - f_avg), INFID_FLOOR)
 
 
-def noisy_infidelity_worker(task):
+# =============================================================================
+# Worker (runs in a child process)
+# =============================================================================
+
+def noisy_infidelity_worker(task: dict) -> dict:
+    """
+    Simulate one pulse under Lindblad noise and return the noisy infidelity.
+
+    Thread control is set here (not at import time) because each worker is
+    a fresh child process and the env vars must be set before TF initialises.
+    """
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -411,9 +474,7 @@ def noisy_infidelity_worker(task):
     except Exception:
         pass
 
-    i = task["i"]
-    j = task["j"]
-    label = task["label"]
+    i, j, label = task["i"], task["j"], task["label"]
 
     try:
         excitation = task["excitation"]
@@ -433,194 +494,86 @@ def noisy_infidelity_worker(task):
         L0 = lindblad_ops_T1_T2(n_spins, task["T1_us"], task["T2_us"])
 
         driven = make_noisy_driven_system(
-            excitation=excitation,
-            target_kind=target_kind,
-            T_ns=T_ns,
-            n_steps=n_steps,
-            n_discretisation=n_discretisation,
-            n_spins=n_spins,
-            n_J_channels=n_J_channels,
-            zeeman=zeeman,
-            initial_state=initial_state,
-            J_min=J_min,
-            J_max=J_max,
-            L0=L0,
+            excitation=excitation, target_kind=target_kind,
+            T_ns=T_ns, n_steps=n_steps, n_discretisation=n_discretisation,
+            n_spins=n_spins, n_J_channels=n_J_channels,
+            zeeman=zeeman, initial_state=initial_state,
+            J_min=J_min, J_max=J_max, L0=L0,
         )
 
         if target_kind == "state":
             rho = driven.propagate(pulse)
             rho_t = target_rho(excitation, theta, T_ns, zeeman, initial_state)
             noisy_I = state_infidelity(rho, rho_t)
-
         elif target_kind == "gate":
             channel = driven.get_evolution(pulse)
             target_channel = target_superoperator(excitation, theta, T_ns, zeeman)
             noisy_I = gate_infidelity(channel, target_channel)
-
         else:
             raise ValueError(target_kind)
 
-        return dict(
-            i=i,
-            j=j,
-            label=label,
-            failed=False,
-            error="",
-            noisy_infid=noisy_I,
-        )
+        return dict(i=i, j=j, label=label, failed=False, error="", noisy_infid=noisy_I)
 
     except Exception as exc:
-        return dict(
-            i=i,
-            j=j,
-            label=label,
-            failed=True,
-            error=repr(exc),
-            noisy_infid=np.nan,
-        )
+        return dict(i=i, j=j, label=label, failed=True, error=repr(exc), noisy_infid=np.nan)
 
 
 # =============================================================================
 # Plotting
 # =============================================================================
 
-def add_colorbar(fig, ax, im, label):
-    cbar = fig.colorbar(
-        im,
-        ax=ax,
-        pad=0.02,
-        fraction=0.046,
-        shrink=1.0,
-        aspect=25,
-    )
-    cbar.set_label(label)
-    return cbar
-
-
-def add_shared_colorbar(fig, axes, im, label):
-    cbar = fig.colorbar(
-        im,
-        ax=axes,
-        pad=0.02,
-        fraction=0.046,
-        shrink=1.0,
-        aspect=25,
-    )
-
-    pos0 = axes[0].get_position()
-
-    cbar.ax.set_position([
-        cbar.ax.get_position().x0,
-        pos0.y0,
-        cbar.ax.get_position().width,
-        pos0.y1 - pos0.y0,
-    ])
-
-    cbar.set_label(label)
-    return cbar
-
-
-def match_colorbar_height_to_axis(cbar, ax):
-    pos = ax.get_position()
-    cbar_pos = cbar.ax.get_position()
-
-    cbar.ax.set_position([
-        cbar_pos.x0,
-        pos.y0,
-        cbar_pos.width,
-        pos.y1 - pos.y0,
-    ])
-
-
-def add_met_contour(ax, theta_over_pi, durations_ns, logI_T_theta):
+def add_met_contour(ax, theta_over_pi: np.ndarray, durations_ns: np.ndarray,
+                    logI_T_theta: np.ndarray):
+    """Draw the MET contour (log₁₀(I) = log₁₀(MET_THRESHOLD)) on *ax*."""
     level = np.log10(MET_THRESHOLD)
-
     if not np.any(np.isfinite(logI_T_theta)):
         return None
-
     zmin = np.nanmin(logI_T_theta)
     zmax = np.nanmax(logI_T_theta)
-
     if not (zmin <= level <= zmax):
         return None
-
     cs = ax.contour(
-        theta_over_pi,
-        durations_ns,
-        logI_T_theta,
-        levels=[level],
-        colors="white",
-        linestyles="--",
-        linewidths=1.8,
+        theta_over_pi, durations_ns, logI_T_theta,
+        levels=[level], colors="white", linestyles="--", linewidths=1.8,
     )
     return cs
 
 
 def plot_noisy_maps(
     *,
-    thetas,
-    durations_ns,
-    base_noisy_infids,
-    ent_noisy_infids,
-    system_name,
-):
+    thetas: np.ndarray,
+    durations_ns: np.ndarray,
+    base_noisy_infids: np.ndarray,
+    ent_noisy_infids: np.ndarray,
+    system_name: str,
+) -> None:
+    """Three-panel figure: baseline | TEM | improvement ratio (noisy infidelities)."""
     theta_over_pi = thetas / np.pi
 
     base = np.maximum(base_noisy_infids, INFID_FLOOR)
     ent = np.maximum(ent_noisy_infids, INFID_FLOOR)
-
     log_base = np.log10(base).T
     log_ent = np.log10(ent).T
-
-    ratio = base / ent
-    log_ratio = np.log10(ratio).T
-
-    infid_vmin = -8
-    infid_vmax = 0
-
-    ratio_vmin = -3
-    ratio_vmax = 3
+    log_ratio = np.log10(base / ent).T
 
     fig, axes = plt.subplots(
-        1,
-        3,
-        figsize=(15, 4.8),
-        constrained_layout=False,
-        sharex=True,
-        sharey=True,
+        1, 3, figsize=(15, 4.8),
+        constrained_layout=True,
+        sharex=True, sharey=True,
     )
 
-    im0 = axes[0].pcolormesh(
-        theta_over_pi,
-        durations_ns,
-        log_base,
-        shading="auto",
-        cmap="inferno",
-        vmin=infid_vmin,
-        vmax=infid_vmax,
-    )
+    im0 = axes[0].pcolormesh(theta_over_pi, durations_ns, log_base,
+                              shading="auto", cmap="inferno",
+                              vmin=-8, vmax=0)
+    im1 = axes[1].pcolormesh(theta_over_pi, durations_ns, log_ent,
+                              shading="auto", cmap="inferno",
+                              vmin=-8, vmax=0)
+    im2 = axes[2].pcolormesh(theta_over_pi, durations_ns, log_ratio,
+                              shading="auto", cmap="coolwarm",
+                              vmin=-3, vmax=3)
+
     cs0 = add_met_contour(axes[0], theta_over_pi, durations_ns, log_base)
-
-    im1 = axes[1].pcolormesh(
-        theta_over_pi,
-        durations_ns,
-        log_ent,
-        shading="auto",
-        cmap="inferno",
-        vmin=infid_vmin,
-        vmax=infid_vmax,
-    )
     cs1 = add_met_contour(axes[1], theta_over_pi, durations_ns, log_ent)
-
-    im2 = axes[2].pcolormesh(
-        theta_over_pi,
-        durations_ns,
-        log_ratio,
-        shading="auto",
-        cmap="coolwarm",
-        vmin=ratio_vmin,
-        vmax=ratio_vmax,
-    )
 
     axes[0].set_title("Baseline")
     axes[1].set_title("TEM")
@@ -630,49 +583,26 @@ def plot_noisy_maps(
         ax.set_xlabel(r"Excitation strength $\theta/\pi$")
         ax.grid(True, alpha=0.25, linestyle="--")
         ax.set_box_aspect(1)
-
     axes[0].set_ylabel(r"Pulse duration $T$ / ns")
 
-    cbar_inf = add_shared_colorbar(
-        fig,
-        axes[:2],
-        im1,
-        r"$\log_{10}(\mathrm{noisy\ final\ infidelity})$",
-    )
+    # Shared colorbar for left and middle panels.
+    fig.colorbar(im1, ax=axes[:2],
+                 label=r"$\log_{10}(\mathrm{noisy\ final\ infidelity})$")
+    fig.colorbar(im2, ax=axes[2],
+                 label=r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$")
 
-    cbar_ratio = add_colorbar(
-        fig,
-        axes[2],
-        im2,
-        r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$",
-    )
-
-    shared_pos = cbar_inf.ax.get_position()
-    right_pos = cbar_ratio.ax.get_position()
-
-    cbar_ratio.ax.set_position([
-        right_pos.x0,
-        shared_pos.y0,
-        right_pos.width,
-        shared_pos.height,
-    ])
-
+    # Add MET threshold contour legend on the middle panel.
     contour_handle = None
     if cs0 is not None:
         contour_handle = cs0.legend_elements()[0][0]
     elif cs1 is not None:
         contour_handle = cs1.legend_elements()[0][0]
-
     if contour_handle is not None:
-        axes[1].legend(
-            [contour_handle],
-            [rf"$I={MET_THRESHOLD:.0e}$"],
-            loc="upper right",
-            frameon=True,
-        )
+        axes[1].legend([contour_handle], [rf"$I={MET_THRESHOLD:.0e}$"],
+                       loc="upper right", frameon=True)
 
     path = OUTDIR / f"{PLOT_PREFIX}_noisy_met.png"
-    fig.savefig(path, dpi=300, bbox_inches="tight")
+    fig.savefig(path, dpi=300)
     plt.close(fig)
     print(f"Saved {path}")
 
@@ -681,7 +611,7 @@ def plot_noisy_maps(
 # Main
 # =============================================================================
 
-def main():
+def main() -> None:
     raw = np.load(INPUT_FILE, allow_pickle=True)
 
     system_name = infer_system_name(raw, INPUT_FILE)
@@ -711,124 +641,63 @@ def main():
     ent_x_final = get_array(raw, "ent_x_final")
 
     pulse_width = baseline_x_final.shape[-1]
-    n_J_channels = infer_n_J_channels(
-        excitation,
-        raw,
-        pulse_width,
-        max_n_time_steps,
-    )
+    n_J_channels = infer_n_J_channels(excitation, raw, pulse_width, max_n_time_steps)
 
     baseline_seed = select_baseline_local(raw)
-    ent_seed, ent_selected_successful = select_ent_local(
-        raw,
-        target_kind,
-        threshold,
-    )
+    ent_seed, ent_selected_successful = select_ent_local(raw, target_kind, threshold)
 
     baseline_final_infids = get_array(raw, "baseline_final_infids")
     ent_final_infids = get_array(raw, "ent_final_infids")
-
-    base_clean_infids = gather_selected_scalar_local(
-        baseline_final_infids,
-        baseline_seed,
-    )
-    ent_clean_infids = gather_selected_scalar_local(
-        ent_final_infids,
-        ent_seed,
-    )
+    base_clean_infids = gather_selected_scalar_local(baseline_final_infids, baseline_seed)
+    ent_clean_infids = gather_selected_scalar_local(ent_final_infids, ent_seed)
 
     n_theta = len(thetas)
     n_T = len(durations_ns)
 
     base_noisy_infids = np.full((n_theta, n_T), np.nan)
     ent_noisy_infids = np.full((n_theta, n_T), np.nan)
-
     failed_base = np.full((n_theta, n_T), False, dtype=bool)
     failed_ent = np.full((n_theta, n_T), False, dtype=bool)
     error_base = np.full((n_theta, n_T), "", dtype=object)
     error_ent = np.full((n_theta, n_T), "", dtype=object)
 
+    # Build task list: one task per (theta, T) per pulse family.
     tasks = []
-
     for i, theta in enumerate(thetas):
         for j, T_ns in enumerate(durations_ns):
             n_steps = int(n_steps_used[i, j])
+            common = dict(
+                excitation=excitation, target_kind=target_kind,
+                theta=float(theta), T_ns=float(T_ns),
+                n_steps=n_steps, n_discretisation=N_DISCRETISATION,
+                n_spins=n_spins, n_J_channels=n_J_channels,
+                zeeman=zeeman, initial_state=initial_state,
+                J_min=J_min, J_max=J_max, T1_us=T1_US, T2_us=T2_US,
+            )
 
             b_seed = baseline_seed[i, j]
             if b_seed >= 0:
-                b_pulse = get_pulse_local(
-                    baseline_x_final,
-                    i=i,
-                    j=j,
-                    seed=b_seed,
-                    n_steps=n_steps,
-                    n_J_channels=n_J_channels,
-                )
-
-                tasks.append(dict(
-                    i=i,
-                    j=j,
-                    label="base",
-                    excitation=excitation,
-                    target_kind=target_kind,
-                    theta=float(theta),
-                    T_ns=float(T_ns),
-                    n_steps=n_steps,
-                    n_discretisation=N_DISCRETISATION,
-                    n_spins=n_spins,
-                    n_J_channels=n_J_channels,
-                    zeeman=zeeman,
-                    initial_state=initial_state,
-                    J_min=J_min,
-                    J_max=J_max,
-                    T1_us=T1_US,
-                    T2_us=T2_US,
-                    pulse=b_pulse,
-                ))
+                b_pulse = get_pulse_local(baseline_x_final, i, j, b_seed,
+                                          n_steps, n_J_channels)
+                tasks.append(dict(i=i, j=j, label="base", pulse=b_pulse, **common))
 
             e_seed = ent_seed[i, j]
             if e_seed >= 0:
-                e_pulse = get_pulse_local(
-                    ent_x_final,
-                    i=i,
-                    j=j,
-                    seed=e_seed,
-                    n_steps=n_steps,
-                    n_J_channels=n_J_channels,
-                )
-
-                tasks.append(dict(
-                    i=i,
-                    j=j,
-                    label="ent",
-                    excitation=excitation,
-                    target_kind=target_kind,
-                    theta=float(theta),
-                    T_ns=float(T_ns),
-                    n_steps=n_steps,
-                    n_discretisation=N_DISCRETISATION,
-                    n_spins=n_spins,
-                    n_J_channels=n_J_channels,
-                    zeeman=zeeman,
-                    initial_state=initial_state,
-                    J_min=J_min,
-                    J_max=J_max,
-                    T1_us=T1_US,
-                    T2_us=T2_US,
-                    pulse=e_pulse,
-                ))
+                e_pulse = get_pulse_local(ent_x_final, i, j, e_seed,
+                                          n_steps, n_J_channels)
+                tasks.append(dict(i=i, j=j, label="ent", pulse=e_pulse, **common))
 
     print("=" * 72)
     print("Noisy pulse-database MET plot")
-    print(f"INPUT_FILE = {INPUT_FILE}")
-    print(f"OUTDIR = {OUTDIR}")
-    print(f"system_name = {system_name}")
-    print(f"excitation = {excitation}")
-    print(f"target_kind = {target_kind}")
-    print(f"n_spins = {n_spins}")
+    print(f"INPUT_FILE   = {INPUT_FILE}")
+    print(f"OUTDIR       = {OUTDIR}")
+    print(f"system_name  = {system_name}")
+    print(f"excitation   = {excitation}")
+    print(f"target_kind  = {target_kind}")
+    print(f"n_spins      = {n_spins}")
     print(f"n_J_channels = {n_J_channels}")
-    print(f"T1 = {T1_US:.6e} us")
-    print(f"T2 = {T2_US:.6e} us")
+    print(f"T1           = {T1_US:.6e} µs")
+    print(f"T2           = {T2_US:.6e} µs")
     print("TEM selection = local lowest-entanglement successful run,")
     print("                otherwise local lowest clean-infidelity run")
     print(f"Total noisy evolutions = {len(tasks)}")
@@ -840,10 +709,7 @@ def main():
         with tqdm(total=len(futures), desc="noisy evolutions", unit="pulse") as pbar:
             for n_done, future in enumerate(as_completed(futures), start=1):
                 result = future.result()
-
-                i = result["i"]
-                j = result["j"]
-                label = result["label"]
+                i, j, label = result["i"], result["j"], result["label"]
 
                 if label == "base":
                     base_noisy_infids[i, j] = result["noisy_infid"]
@@ -872,10 +738,8 @@ def main():
                 pbar.update(1)
 
     plot_noisy_maps(
-        thetas=thetas,
-        durations_ns=durations_ns,
-        base_noisy_infids=base_noisy_infids,
-        ent_noisy_infids=ent_noisy_infids,
+        thetas=thetas, durations_ns=durations_ns,
+        base_noisy_infids=base_noisy_infids, ent_noisy_infids=ent_noisy_infids,
         system_name=system_name,
     )
 
@@ -887,7 +751,8 @@ def main():
     print(f"Best clean TEM infidelity      = {np.nanmin(ent_clean_infids):.6e}")
     print(f"Best noisy baseline infidelity = {np.nanmin(base_noisy_infids):.6e}")
     print(f"Best noisy TEM infidelity      = {np.nanmin(ent_noisy_infids):.6e}")
-    print(f"Max noisy improvement ratio    = {np.nanmax(base_noisy_infids / ent_noisy_infids):.6e}")
+    print(f"Max noisy improvement ratio    = "
+          f"{np.nanmax(base_noisy_infids / ent_noisy_infids):.6e}")
     print(f"Failed baseline evolutions     = {np.sum(failed_base)}")
     print(f"Failed TEM evolutions          = {np.sum(failed_ent)}")
     print("=" * 72)

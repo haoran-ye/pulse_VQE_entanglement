@@ -8,7 +8,7 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 
 DATA = Path(
     "/Users/yehaoran/Desktop/VQE_Chem/pulse_vqe_entanglement/Thesis/PULSES_DATABASE/"
-    "sqe_gate_positiveJ_rowprop_pulses.npz"
+    "dqe_gate_positiveJ_rowprop_pulses.npz"
 )
 
 INFID_THRESHOLD = 1e-5

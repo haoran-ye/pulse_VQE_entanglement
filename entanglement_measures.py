@@ -175,26 +175,18 @@ def entropy_bipartite_traj(traj: np.ndarray, *,
     dim_A = 2 ** len(A)
     dim_B = 2 ** len(B)
 
-    # Reshape to (n_t, 2, 2, ..., 2), one axis per qubit after the batch axis
     psi = traj.T.reshape((n_t,) + (2,) * n_qubits)
-
-    # Permute so subsystem A qubits come first, then B
     psi = np.transpose(psi, (0,) + tuple(a + 1 for a in A) + tuple(b + 1 for b in B))
-
-    # Flatten into (n_t, dim_A, dim_B)
     psi = psi.reshape(n_t, dim_A, dim_B)
 
-    # Batch reduced density matrix rho_A = psi @ psi†, shape (n_t, dim_A, dim_A)
     rho_A = psi @ np.conj(psi).transpose(0, 2, 1)
+    eig = np.clip(np.linalg.eigvalsh(rho_A), 1e-15, 1.0)
+    return -np.sum(eig * np.log2(eig), axis=1)
 
-    eig = np.clip(np.linalg.eigvalsh(rho_A), 1e-15, 1.0)   # (n_t, dim_A)
-    return -np.sum(eig * np.log2(eig), axis=1)              # (n_t,)
 
-
-# All distinct bipartite partitions of 4 qubits
 ALL_BIPARTITIONS_4Q: tuple[tuple[int, ...], ...] = (
-    (0,), (1,), (2,), (3,),      # four single-qubit cuts
-    (0, 1), (0, 2), (0, 3),      # three two-qubit cuts
+    (0,), (1,), (2,), (3,),
+    (0, 1), (0, 2), (0, 3),
 )
 
 
@@ -234,13 +226,9 @@ def entropy_sum_traj(traj: np.ndarray, *, n_qubits=4) -> np.ndarray:
 
 def operator_entanglement(U: np.ndarray) -> float:
     """
-    Shannon entropy of the squared operator-Schmidt coefficients (deterministic).
+    Shannon entropy of the squared operator-Schmidt coefficients.
 
-    Treats U as a state on (A_out ⊗ A_in) | (B_out ⊗ B_in), computes the
-    operator Schmidt decomposition via SVD, and returns -Σ p_i log₂(p_i)
-    where p_i = σ_i² are the normalised squared singular values.
-
-    This is the default gate entanglement measure.
+    This measures nonlocal operator structure, not directly entangling power.
     """
     T = (U / 2.0).reshape(2, 2, 2, 2).transpose(0, 2, 1, 3).reshape(4, 4)
     s = np.linalg.svd(T, compute_uv=False)
@@ -254,8 +242,7 @@ def average_entangling_power(U: np.ndarray, n_samples: int = 20,
     """
     MC estimate of average output entanglement over random product inputs.
 
-    Computes mean_{|ψ⟩} S(U|ψ⟩) where |ψ⟩ is a Haar-random product state
-    and S is the von Neumann entropy of qubit A.
+    Computes mean_{|ψ⟩} S(U|ψ⟩), where |ψ⟩ is a Haar-random product state.
     """
     rng = np.random.default_rng(seed)
     return float(np.mean([
@@ -267,8 +254,6 @@ def max_output_entanglement(U: np.ndarray, n_trials: int = 10,
                             seed: int | None = None) -> float:
     """
     MC estimate of maximum output entanglement over random product inputs.
-
-    Approximates max_{|ψ⟩} S(U|ψ⟩) over product states via random search.
     """
     rng = np.random.default_rng(seed)
     return float(max(
@@ -281,16 +266,54 @@ def assisted_entangling_power(U: np.ndarray, n_trials: int = 10,
     """
     MC estimate of maximum entanglement gain over arbitrary pure inputs.
 
-    Approximates max_{|ψ⟩} [S(U|ψ⟩) - S(|ψ⟩)] over all 2-qubit pure states
-    via random search. Does not include ancilla assistance.
+    Approximates max_{|ψ⟩} [S(U|ψ⟩) - S(|ψ⟩)].
+    Does not include ancilla assistance.
     """
     rng = np.random.default_rng(seed)
     best = -np.inf
     for _ in range(n_trials):
         psi = _haar_state(4, rng)
-        best = max(best,
-                   von_neumann_entropy_single(U @ psi) - von_neumann_entropy_single(psi))
+        best = max(
+            best,
+            von_neumann_entropy_single(U @ psi) - von_neumann_entropy_single(psi)
+        )
     return float(best)
+
+
+def cnot_infidelity(U: np.ndarray) -> float:
+    """
+    Average gate infidelity with respect to the standard CNOT gate.
+
+    This is not a true entanglement measure. It is a deterministic diagnostic
+    for whether a transient 2-qubit unitary becomes close to CNOT itself.
+
+    Lower value  = more CNOT-like.
+    Higher value = further from CNOT.
+
+    Computational-basis convention:
+        |00> -> |00>
+        |01> -> |01>
+        |10> -> |11>
+        |11> -> |10>
+    """
+    U = np.asarray(U, dtype=np.complex128)
+
+    U_cnot = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 0, 1],
+            [0, 0, 1, 0],
+        ],
+        dtype=np.complex128,
+    )
+
+    d = 4
+    avg_fidelity = (
+        np.abs(np.trace(U_cnot.conj().T @ U)) ** 2 + d
+    ) / (d * (d + 1))
+
+    return float(1.0 - avg_fidelity)
 
 
 # Default alias used when no config measure is specified
@@ -308,20 +331,17 @@ def operator_entanglement_bipartite(U: np.ndarray, *,
 
     Reshapes U as a bilinear map (A_out ⊗ B_out) ← (A_in ⊗ B_in), computes
     the operator Schmidt decomposition via SVD, and returns the Shannon entropy
-    of the squared singular values.  Normalised so that Σ p_i = 1 for unitary U.
-
-    Convention matches operator_entanglement for 2-qubit gates: divide by
-    sqrt(2^n_qubits) before SVD.
+    of the squared singular values. Normalised so that Σ p_i = 1 for unitary U.
     """
     n = n_qubits
     A = tuple(subsystem)
     B = tuple(q for q in range(n) if q not in A)
-    # Reshape U (2^n × 2^n): axes 0..n-1 = output qubits, axes n..2n-1 = input qubits
+
     U_r = U.reshape((2,) * (2 * n))
-    # Permute to (A_out, A_in, B_out, B_in), then reshape to (dim_A², dim_B²)
     perm = tuple(A) + tuple(a + n for a in A) + tuple(B) + tuple(b + n for b in B)
     T = U_r.transpose(perm).reshape(4 ** len(A), 4 ** len(B))
     T = T / np.sqrt(2 ** n)
+
     s = np.linalg.svd(T, compute_uv=False)
     p = s ** 2
     p = p[p > 1e-15]
@@ -332,8 +352,7 @@ def operator_entanglement_sum_4q(U: np.ndarray) -> float:
     """
     Sum of operator entanglement over all 7 distinct bipartitions of a 4-qubit gate.
 
-    Analogous to entropy_sum_single for states: sums operator_entanglement_bipartite
-    over ALL_BIPARTITIONS_4Q.  Used as the default DQE gate entanglement cost.
+    Analogous to entropy_sum_single for states.
     """
     return sum(
         operator_entanglement_bipartite(U, subsystem=p, n_qubits=4)
@@ -369,6 +388,8 @@ GATE_MEASURES: dict[str, object] = {
     "average_entangling_power":     average_entangling_power,
     "max_output_entanglement":      max_output_entanglement,
     "assisted_entangling_power":    assisted_entangling_power,
+    "cnot_infidelity":              cnot_infidelity,
+
     # 4-qubit (16×16 unitary)
     "operator_entanglement_sum_4q": operator_entanglement_sum_4q,
 }
@@ -382,6 +403,7 @@ GATE_MEASURE_LABELS: dict[str, str] = {
     "average_entangling_power":     "Avg. Entangling Power (bits)",
     "max_output_entanglement":      "Max Output Entanglement (bits)",
     "assisted_entangling_power":    "Assisted Entangling Power (bits)",
+    "cnot_infidelity":              r"CNOT Infidelity $\mathcal{I}_{\mathrm{CNOT}}$",
     "operator_entanglement_sum_4q": r"$\Sigma_P$ Op. Entanglement (bits)",
 }
 """Y-axis labels for gate entanglement plots."""
@@ -391,6 +413,7 @@ GATE_MEASURE_TITLES: dict[str, str] = {
     "average_entangling_power":     "Average Entangling Power Evolution",
     "max_output_entanglement":      "Max Output Entanglement Evolution",
     "assisted_entangling_power":    "Assisted Entangling Power Evolution",
+    "cnot_infidelity":              "CNOT Infidelity Evolution",
     "operator_entanglement_sum_4q": "Total Operator Entanglement (sum over 7 bipartitions)",
 }
 """Panel titles for gate entanglement plots."""
@@ -400,6 +423,7 @@ GATE_MEASURE_DETERMINISTIC: dict[str, bool] = {
     "average_entangling_power":     False,
     "max_output_entanglement":      False,
     "assisted_entangling_power":    False,
+    "cnot_infidelity":              True,
     "operator_entanglement_sum_4q": True,
 }
 """True for measures cheap enough to evaluate a target line at plot time."""

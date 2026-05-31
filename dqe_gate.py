@@ -116,16 +116,22 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain):
 
 def _build_basis_driven_systems(config: SimulationConfig, sys: SpinChain) -> list:
     """
-    Build one driven system per 16-dimensional computational basis state.
+    Build one driven system per computational basis state of a 4-qubit system.
 
-    Constructed once before optimisation so TF graph compilation happens only
-    once, not on every function evaluation.
+    The full 16×16 unitary U(t) is reconstructed from its 16 columns: U(t)|i⟩.
+    Building these systems once before optimisation ensures that TF graph
+    compilation occurs only once (not per function evaluation).  Note: 16 systems
+    are significantly more expensive to compile than the 4 used for SQE.
+
+    Returns
+    -------
+    list of 16 driven systems, one per basis state |0000⟩ … |1111⟩.
     """
     dim     = 16
     systems = []
     for i in range(dim):
         basis    = np.zeros(dim, dtype=np.complex128)
-        basis[i] = 1.0
+        basis[i] = 1.0                     # |i⟩ computational basis state (16-dim)
         cfg_i    = SimulationConfig(**vars(config))
         cfg_i.initial_state = basis
         systems.append(_make_driven_sys(cfg_i, sys))
@@ -150,6 +156,8 @@ def _get_unitary_traj(config: SimulationConfig, sys: SpinChain, x: np.ndarray,
         basis_driven_systems = _build_basis_driven_systems(config, sys)
 
     for i, ds in enumerate(basis_driven_systems):
+        # propagate_all returns (16, n_fine+1); column j is the state at time j.
+        # Transpose to (n_fine+1, 16) and store as the i-th column of U_traj.
         U_traj[:, :, i] = np.asarray(ds.propagate_all(x)).T   # (16, n_fine+1).T → (n_fine+1, 16)
 
     return U_traj
@@ -239,13 +247,16 @@ def _lagrangian_and_grad(
     where EP_cost is the mean-squared gate entanglement violation and
     GI is the gate infidelity (GI ≤ ε enforced via λ).
     """
+    # Gate entanglement cost and its parallelised central-difference gradient
     EP  = _cost_gate_entanglement(basis_driven_systems, config, x, ep_max=ep_max)
     gEP = _ep_grad_fd(basis_driven_systems, config, x, ep_max=ep_max, eps=fd_eps)
 
+    # Gate infidelity and autodiff gradient (QuGrad gate_gradient method)
     gi, ggi = driven_sys.gate_gradient(x, target_gate)
     gi, ggi = float(gi), np.asarray(ggi, float)
-    c = gi - float(eps_infidelity)
+    c = gi - float(eps_infidelity)           # constraint residual GI − ε
 
+    # L = EP + λ(GI−ε) + (ρ/2)(GI−ε)²,  ∇L = ∇EP + (λ + ρc)∇GI
     L  = EP + lam * c + 0.5 * float(rho) * c ** 2
     gL = gEP + (lam + float(rho) * c) * ggi
     return float(L), gL
@@ -281,6 +292,7 @@ def _primal_dual_optimise(
 
         gi  = float(driven_sys.gate_gradient(x, target_gate)[0])
         c   = gi - float(config.eps_infidelity)
+        # Dual ascent: λ ← max(0, λ + α(GI−ε)); max(0,·) is the KKT projection
         lam = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
@@ -334,15 +346,17 @@ def dqe_gate_optimisation(config: SimulationConfig) -> DQEGateResults:
             raise ValueError(f"Unknown extra_ent_measure: {name!r}. Valid: {list(GATE_MEASURES)}")
 
     cfg = SimulationConfig(**vars(config))   # local copy — do not mutate caller's config
-    cfg.n_J_channels = 3
+    cfg.n_J_channels = 3                    # DQE uses 3 J channels (J₁₂, J₂₃, J₃₄)
 
+    # Build rotating frame: deltaB = B − mean(B); dress target gate with U_rot
     deltaB, U_rot         = make_rotating_frame(cfg.zeeman_splittings, cfg.T)
     target_gate           = U_rot @ dqe_unitary(cfg.theta_target)
-    cfg.zeeman_splittings = deltaB
+    cfg.zeeman_splittings = deltaB               # SpinChain uses relative detunings
 
+    # Default initial state |0011⟩ = basis index 3 if none provided
     if cfg.initial_state is None or len(cfg.initial_state) != 16:
-        cfg.initial_state = np.zeros(16, dtype=np.complex128)
-        cfg.initial_state[3] = 1.0  # |0011⟩ default
+        cfg.initial_state    = np.zeros(16, dtype=np.complex128)
+        cfg.initial_state[3] = 1.0              # |0011⟩ in big-endian notation
 
     sys        = _make_system(cfg)
     driven_sys = _make_driven_sys(cfg, sys)
@@ -350,7 +364,8 @@ def dqe_gate_optimisation(config: SimulationConfig) -> DQEGateResults:
     x0     = _initialise_x0(cfg)
     bounds = [(-1.0, 1.0)] * x0.size
 
-    # Build TF graphs once; reused by every entanglement cost evaluation.
+    # Build 16 basis-state driven systems once — TF graph compilation happens here.
+    # This is the expensive step (~seconds); all cost evaluations reuse these graphs.
     basis_driven_systems = _build_basis_driven_systems(cfg, sys)
 
     def _solve_infidelity(x_init: np.ndarray):

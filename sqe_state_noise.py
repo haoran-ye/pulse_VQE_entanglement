@@ -1,13 +1,40 @@
 """
 Single Qubit Excitation (SQE) optimisation for 2-spin systems with Lindblad noise.
 
-Closed-system optimisation is performed as in sqe_state.  After optimisation,
-the obtained pulses are optionally evaluated under Lindblad density-matrix
-dynamics.  The SpinChain itself does not natively support Lindblad evolution;
-the driven QuGrad system is converted separately.
+Overview
+--------
+Pulse optimisation is performed under *closed-system* (unitary) state-vector
+dynamics, identical to sqe_state.  The optimised pulse is then re-evaluated
+under *open-system* Lindblad density-matrix dynamics to quantify noise sensitivity.
+
+This separation means the Lindblad noise does NOT affect the gradient used during
+optimisation — it is a post-hoc diagnostic only.  To include noise in the
+optimisation itself, a full Lindblad-based gradient would be needed.
+
+Lindblad equation
+-----------------
+    dρ/dt = −i[H, ρ] + Σ_k (L_k ρ L_k† − ½{L_k† L_k, ρ})
+
+Supported noise models
+----------------------
+dephasing     : L_k = sqrt(γ) Z_k  (pure phase damping, one operator per qubit)
+depolarising  : L_k = sqrt(γ/3) {X_k, Y_k, Z_k}  (isotropic single-qubit noise)
 
 config.noise_type : "none" | "dephasing" | "depolarising"
-config.noise_rate : Lindblad collapse-operator rate (γ).
+config.noise_rate : Lindblad collapse rate γ (MHz, same units as Zeeman frequencies)
+
+entanglement_optimisation flag
+-------------------------------
+False : Minimize state infidelity only (uses QuGrad autodiff gradient).
+True  : First minimize infidelity, then run the entropy-constrained primal-dual
+        loop from the same x0; baseline result stored in results.baseline.
+Both cases re-evaluate the final (and initial) pulse under Lindblad dynamics
+when noise_type != "none".
+
+Entanglement measure
+--------------------
+Set config.state_ent_measure to any key in entanglement_measures.STATE_MEASURES.
+Currently supported: "von_neumann" (default), "linear".
 """
 from __future__ import annotations
 
@@ -44,19 +71,26 @@ def _get_noise_rate(config: SimulationConfig) -> float:
 
 def _make_system_and_observable(config: SimulationConfig):
     """
-    Create the closed-system SpinChain, target state, and state-infidelity
-    observable.
+    Create the closed-system SpinChain, target state, and state-infidelity observable.
+
+    The SpinChain is built in the rotating frame (drift = deltaB only).
+    The target state and observable are constructed in the same frame.
+    The target_state is also returned separately for Lindblad fidelity evaluation.
 
     Returns
     -------
     sys : SpinChain
-    observable : np.ndarray
-        I − |ψ_target⟩⟨ψ_target|
-    target_state : np.ndarray
+    observable : ndarray, shape (4, 4)
+        I − |ψ_target⟩⟨ψ_target|; its expectation value equals the state infidelity.
+    target_state : ndarray, shape (4,)
+        Rotating-frame target state used for density-matrix fidelity calculations.
     """
+    # Build rotating frame: deltaB = B − mean(B); U_rot = expm(−iπ H_frame T·1e-3)
     deltaB, U_rot = make_rotating_frame(config.zeeman_splittings, config.T)
 
+    # Target state in the rotating frame: apply SQE gate then dress with U_rot
     target_state = U_rot @ single_qubit_excitation(config.theta_target) @ config.initial_state
+    # Projector onto complement of |ψ_target⟩; expectation value = infidelity
     observable   = np.eye(4, dtype=np.complex128) - np.outer(target_state, target_state.conj())
 
     sys = SpinChain(
@@ -79,15 +113,17 @@ def _make_driven_sys(config: SimulationConfig, sys: SpinChain,
     Parameters
     ----------
     lindblad_initial_state : bool
-        If True the initial state is set to the density matrix ρ₀ = |ψ₀⟩⟨ψ₀|;
-        otherwise it is the state vector |ψ₀⟩.  The Lindblad conversion itself
-        is not performed here.
+        If True the initial state is set to ρ₀ = |ψ₀⟩⟨ψ₀| (density matrix).
+        The Lindblad operator extension is applied separately via
+        driven_base.add_lindblad_terms(). If False, the state vector |ψ₀⟩ is used
+        (closed-system evolution).
     """
     n_steps    = config.n_time_steps
     n_disc     = config.n_discretisation
     n_fine     = n_steps * n_disc
     dt_fine_us = (config.T / n_fine) * NS_TO_US
 
+    # Choose initial state: density matrix for Lindblad, state vector for closed-system
     initial_state = (
         np.outer(config.initial_state, config.initial_state.conj())
         if lindblad_initial_state else config.initial_state
@@ -115,9 +151,12 @@ def _make_lindblad_operators(config: SimulationConfig) -> np.ndarray | None:
     """
     Construct collapse operators for two-qubit Lindblad noise.
 
-    noise_type = "none"       : returns None.
-    noise_type = "dephasing"  : L_k = sqrt(γ) Z_k.
-    noise_type = "depolarising": L_k = sqrt(γ/3) {X,Y,Z}_k.
+    noise_type = "none"        : returns None (no noise evaluation).
+    noise_type = "dephasing"   : L_k = sqrt(γ) Z_k, one per qubit.
+    noise_type = "depolarising": L_k = sqrt(γ/3) {X_k, Y_k, Z_k}, three per qubit.
+
+    The factor sqrt(γ) appears because the Lindblad equation is
+    dρ/dt ∋ γ (Z ρ Z − ρ), and the standard form uses L_k with coefficient 1.
     """
     noise_type = _get_noise_type(config)
     gamma      = _get_noise_rate(config)
@@ -130,14 +169,17 @@ def _make_lindblad_operators(config: SimulationConfig) -> np.ndarray | None:
     Y  = np.array([[0.0, -1j], [1j,  0.0]], dtype=np.complex128)
     Z  = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
 
+    # Two-qubit operators: Pauli on qubit 0 (X1 = X⊗I) or qubit 1 (X2 = I⊗X)
     X1, X2 = np.kron(X, I2), np.kron(I2, X)
     Y1, Y2 = np.kron(Y, I2), np.kron(I2, Y)
     Z1, Z2 = np.kron(Z, I2), np.kron(I2, Z)
 
     if noise_type == "dephasing":
+        # Pure dephasing: only phase information is lost, populations are unchanged
         return np.array([np.sqrt(gamma) * Z1, np.sqrt(gamma) * Z2], dtype=np.complex128)
 
     if noise_type == "depolarising":
+        # Equal X, Y, Z channels at rate γ/3 each → total depolarisation rate γ
         p = np.sqrt(gamma / 3.0)
         return np.array([p*X1, p*Y1, p*Z1, p*X2, p*Y2, p*Z2], dtype=np.complex128)
 
@@ -262,13 +304,21 @@ def _entropy_grad_fd(driven_sys, x, *, S_max: float, eps: float, ent_traj_fn) ->
 
 def _lagrangian_and_grad(driven_sys, x, *, observable, lam, S_max, fd_eps,
                          rho, eps_infidelity, ent_traj_fn):
+    """
+    Augmented Lagrangian L(x, λ) = cost(x) + λ(I−ε) + (ρ/2)(I−ε)².
+
+    cost is the mean-squared entanglement hinge violation; I is the state
+    infidelity under closed-system (unitary) dynamics. ∇L = ∇cost + (λ+ρc)∇I.
+    """
+    # Entanglement cost and finite-difference gradient
     S  = _cost_entropy(driven_sys, x, S_max=S_max, ent_traj_fn=ent_traj_fn)
     gS = _entropy_grad_fd(driven_sys, x, S_max=S_max, eps=fd_eps, ent_traj_fn=ent_traj_fn)
 
+    # Infidelity and autodiff gradient (QuGrad); guard against complex arithmetic noise
     infidelity, grad_inf = driven_sys.gradient(x, observable)
     infidelity = max(0.0, float(np.real(infidelity)))
     grad_inf   = np.asarray(grad_inf, float)
-    c = infidelity - eps_infidelity
+    c = infidelity - eps_infidelity                  # constraint residual I − ε
 
     L  = S + lam * c + 0.5 * rho * c**2
     gL = gS + (lam + rho * c) * grad_inf
@@ -297,6 +347,7 @@ def _primal_dual_optimise(driven_sys, x0, *, observable, bounds,
         S          = _cost_entropy(driven_sys, x, S_max=float(config.S_max), ent_traj_fn=ent_traj_fn)
         infidelity = np.real(driven_sys.gradient(x, observable)[0])
         c          = infidelity - float(config.eps_infidelity)
+        # Dual ascent: λ ← max(0, λ + α(I−ε)); max(0,·) is the KKT projection
         lam        = max(0.0, lam + float(config.dual_lr) * c)
 
         hist.append({
