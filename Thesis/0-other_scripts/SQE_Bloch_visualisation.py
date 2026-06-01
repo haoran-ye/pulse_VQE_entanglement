@@ -55,8 +55,8 @@ OUTDIR.mkdir(parents=True, exist_ok=True)
 
 RUN_ENTANGLEMENT_OPTIMISATION = True
 
-THETA = 0.05 * np.pi  # SQE gate angle (radians)
-T_NS = 300.0          # total pulse duration (ns)
+THETA = 0.01 * np.pi  # SQE gate angle (radians)
+T_NS = 500.0          # total pulse duration (ns)
 N_TIME_STEPS = 50
 N_DISCRETISATION = 1
 
@@ -80,7 +80,7 @@ GTOL = 1e-12
 
 STATE_ENT_MEASURE = "von_neumann"
 
-INITIAL_STATE = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.complex128)  # |01⟩
+INITIAL_STATE = np.array([0.0, 1.0, 1.0, 0.0]/np.sqrt(2), dtype=np.complex128)  # |01⟩
 ZEEMAN_SPLITTINGS = np.array([1000.0, 1008.0])  # MHz
 
 # Bloch sphere heatmap parameters.
@@ -264,7 +264,7 @@ def run_optimisation():
 
 def plot_summary(res_base, res_ent) -> None:
     """Three-row summary: control pulse, infidelity evolution, entropy trajectory."""
-    fig, axes = plt.subplots(3, 1, figsize=(11, 8))
+    fig, axes = plt.subplots(3, 1, figsize=(9, 6))
 
     t_seg = np.arange(N_TIME_STEPS + 1) * T_NS / N_TIME_STEPS
     n_fine = N_TIME_STEPS * N_DISCRETISATION
@@ -280,8 +280,7 @@ def plot_summary(res_base, res_ent) -> None:
                      label="Entanglement constrained", color=COLOR_ENT)
     axes[0].set_xlabel("Time (ns)")
     axes[0].set_ylabel(r"$J$ (MHz)")
-    axes[0].set_title("Control pulse")
-    axes[0].legend()
+    axes[0].set_title("(a) Control pulse")
 
     # --- Infidelity evolution ---
     axes[1].plot(t_fine, np.maximum(res_base.val_final, 1e-16),
@@ -292,8 +291,7 @@ def plot_summary(res_base, res_ent) -> None:
     axes[1].set_yscale("log")
     axes[1].set_xlabel("Time (ns)")
     axes[1].set_ylabel("Infidelity")
-    axes[1].set_title("Infidelity evolution")
-    axes[1].legend()
+    axes[1].set_title("(b) Infidelity evolution")
 
     # --- Entropy trajectory ---
     S_base = entropy_traj_2q(res_base.final_traj)
@@ -310,8 +308,7 @@ def plot_summary(res_base, res_ent) -> None:
     axes[2].set_xlabel("Time (ns)")
     axes[2].set_ylabel(r"$S$ (bits)")
     axes[2].set_ylim(-0.02, 1.02)
-    axes[2].set_title("Entanglement entropy trajectory")
-    axes[2].legend()
+    axes[2].set_title("(c) Entanglement entropy trajectory")
 
     fig.tight_layout()
     fig.savefig(OUTDIR / f"sqe_state_summary_{mode_suffix()}.png", dpi=300)
@@ -392,7 +389,7 @@ def plot_bloch_sphere(res_base, res_ent) -> None:
     ax.set_zlim(-lim, lim)
     ax.set_box_aspect((1, 1, 1))
     ax.view_init(elev=22, azim=45)
-    ax.set_title(r"Projected SQE trajectory in $\{|01\rangle, |10\rangle\}$")
+    ax.set_title(r"(d) Projected SQE trajectory in $\{|01\rangle, |10\rangle\}$")
     ax.legend(loc="upper left")
 
     fig.tight_layout()

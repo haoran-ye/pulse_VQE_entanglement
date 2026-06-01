@@ -54,7 +54,7 @@ from pulse_vqe_entanglement.dqe_state import dqe_unitary, basis_state
 
 # B1 fix: INPUT_FILE resolved relative to this script.
 PULSES_DATABASE = Path(__file__).resolve().parent.parent / "PULSES_DATABASE"
-INPUT_FILE = PULSES_DATABASE / "dqe_gate_positiveJ_pulses.npz"
+INPUT_FILE = PULSES_DATABASE / "sqe_state_initstate_bell_positiveJ_pulses.npz"
 
 OUTDIR = Path(__file__).resolve().parent
 OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +69,7 @@ T2_US = 1.0e3  # T2 dephasing time (µs)
 
 INFID_FLOOR = 1e-16
 CLEAN_INF_THRESHOLD = 1e-5
-MET_THRESHOLD = 1e-5
+MET_THRESHOLD = 1e-20
 
 ENTANGLEMENT_STAT = "avg"
 # ENTANGLEMENT_STAT = "max"
@@ -539,6 +539,23 @@ def add_met_contour(ax, theta_over_pi: np.ndarray, durations_ns: np.ndarray,
     return cs
 
 
+# =============================================================================
+# Plot appearance
+# =============================================================================
+
+FIGSIZE = (14.5, 4.8)
+DPI = 300
+
+TITLE_FONTSIZE = 15
+LABEL_FONTSIZE = 13
+TICK_FONTSIZE = 12
+CBAR_LABEL_FONTSIZE = 12
+CBAR_TICK_FONTSIZE = 11
+LEGEND_FONTSIZE = 11
+
+GRID_ALPHA = 0.25
+
+
 def plot_noisy_maps(
     *,
     thetas: np.ndarray,
@@ -547,62 +564,129 @@ def plot_noisy_maps(
     ent_noisy_infids: np.ndarray,
     system_name: str,
 ) -> None:
-    """Three-panel figure: baseline | TEM | improvement ratio (noisy infidelities)."""
+    """Three-panel figure: baseline | TEM | improvement ratio."""
     theta_over_pi = thetas / np.pi
 
     base = np.maximum(base_noisy_infids, INFID_FLOOR)
     ent = np.maximum(ent_noisy_infids, INFID_FLOOR)
+
     log_base = np.log10(base).T
     log_ent = np.log10(ent).T
     log_ratio = np.log10(base / ent).T
 
-    fig, axes = plt.subplots(
-        1, 3, figsize=(15, 4.8),
-        constrained_layout=True,
-        sharex=True, sharey=True,
+    fig = plt.figure(figsize=FIGSIZE)
+
+    # Same manual geometry as the working TEM plots.
+    ax_positions = [
+        [0.07, 0.15, 0.255, 0.72],   # panel (a)
+        [0.350, 0.15, 0.255, 0.72],  # panel (b)
+        [0.700, 0.15, 0.255, 0.72],  # panel (c)
+    ]
+
+    cbar_width = 0.012
+    cbar_pad = 0.010
+
+    axes = [fig.add_axes(pos) for pos in ax_positions]
+
+    im0 = axes[0].pcolormesh(
+        theta_over_pi,
+        durations_ns,
+        log_base,
+        shading="auto",
+        cmap="inferno",
+        vmin=-8,
+        vmax=0,
     )
 
-    im0 = axes[0].pcolormesh(theta_over_pi, durations_ns, log_base,
-                              shading="auto", cmap="inferno",
-                              vmin=-8, vmax=0)
-    im1 = axes[1].pcolormesh(theta_over_pi, durations_ns, log_ent,
-                              shading="auto", cmap="inferno",
-                              vmin=-8, vmax=0)
-    im2 = axes[2].pcolormesh(theta_over_pi, durations_ns, log_ratio,
-                              shading="auto", cmap="coolwarm",
-                              vmin=-3, vmax=3)
+    im1 = axes[1].pcolormesh(
+        theta_over_pi,
+        durations_ns,
+        log_ent,
+        shading="auto",
+        cmap="inferno",
+        vmin=-8,
+        vmax=0,
+    )
+
+    im2 = axes[2].pcolormesh(
+        theta_over_pi,
+        durations_ns,
+        log_ratio,
+        shading="auto",
+        cmap="coolwarm",
+        vmin=-3,
+        vmax=3,
+    )
 
     cs0 = add_met_contour(axes[0], theta_over_pi, durations_ns, log_base)
     cs1 = add_met_contour(axes[1], theta_over_pi, durations_ns, log_ent)
 
-    axes[0].set_title("Baseline")
-    axes[1].set_title("TEM")
-    axes[2].set_title(r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$")
+    axes[0].set_title("(a) Baseline", fontsize=TITLE_FONTSIZE)
+    axes[1].set_title("(b) TEM", fontsize=TITLE_FONTSIZE)
+    axes[2].set_title(
+        r"(c) $\log_{10}(I_{\rm base}/I_{\rm TEM})$",
+        fontsize=TITLE_FONTSIZE,
+    )
 
     for ax in axes:
-        ax.set_xlabel(r"Excitation strength $\theta/\pi$")
-        ax.grid(True, alpha=0.25, linestyle="--")
-        ax.set_box_aspect(1)
-    axes[0].set_ylabel(r"Pulse duration $T$ / ns")
+        ax.set_xlabel(
+            r"Excitation strength $\theta/\pi$",
+            fontsize=LABEL_FONTSIZE,
+        )
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+        ax.grid(True, alpha=GRID_ALPHA, linestyle="--")
 
-    # Shared colorbar for left and middle panels.
-    fig.colorbar(im1, ax=axes[:2],
-                 label=r"$\log_{10}(\mathrm{noisy\ final\ infidelity})$")
-    fig.colorbar(im2, ax=axes[2],
-                 label=r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$")
+    axes[0].set_ylabel(
+        r"Pulse duration $T$ / ns",
+        fontsize=LABEL_FONTSIZE,
+    )
 
-    # Add MET threshold contour legend on the middle panel.
+    for ax in axes[1:]:
+        ax.tick_params(labelleft=False)
+
+    # Colourbars exactly as tall as the plot panels.
+    cbar_items = [
+        (
+            axes[1],
+            im1,
+            r"$\log_{10}(\mathrm{noisy\ final\ infidelity})$",
+        ),
+        (
+            axes[2],
+            im2,
+            r"$\log_{10}(I_{\rm base}/I_{\rm TEM})$",
+        ),
+    ]
+
+    for ax, im, label in cbar_items:
+        pos = ax.get_position()
+        cax = fig.add_axes([
+            pos.x1 + cbar_pad,
+            pos.y0,
+            cbar_width,
+            pos.height,
+        ])
+        cbar = fig.colorbar(im, cax=cax)
+        cbar.set_label(label, fontsize=CBAR_LABEL_FONTSIZE)
+        cbar.ax.tick_params(labelsize=CBAR_TICK_FONTSIZE)
+
     contour_handle = None
     if cs0 is not None:
         contour_handle = cs0.legend_elements()[0][0]
     elif cs1 is not None:
         contour_handle = cs1.legend_elements()[0][0]
+
     if contour_handle is not None:
-        axes[1].legend([contour_handle], [rf"$I={MET_THRESHOLD:.0e}$"],
-                       loc="upper right", frameon=True)
+        axes[1].legend(
+            [contour_handle],
+            [rf"$I={MET_THRESHOLD:.0e}$"],
+            loc="upper right",
+            frameon=True,
+            fontsize=LEGEND_FONTSIZE,
+        )
 
     path = OUTDIR / f"{PLOT_PREFIX}_noisy_met.png"
-    fig.savefig(path, dpi=300)
+    fig.savefig(path, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {path}")
 

@@ -3,32 +3,20 @@
 3-plot_pulse_database_met_ent.py
 
 Three-panel MET + entanglement plotter for raw pulse databases.
-
-Produces two PNG files per run:
-
-  1. Infidelity three-panel (baseline | TEM | Δlog₁₀I)
-  2. Entanglement three-panel (baseline | TEM | reduction)
-
-Each panel shows a MET line for the baseline and/or TEM pulse family.
-
-Compatible databases
---------------------
-  Works for state databases (keys: baseline_s_avg, ent_s_avg, …) and gate
-  databases (keys: baseline_ent_avg, ent_ent_avg, …).
 """
 
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 # =============================================================================
 # User settings
 # =============================================================================
 
-# B1 fix: INPUT_FILE resolved relative to this script.
 PULSES_DATABASE = Path(__file__).resolve().parent.parent / "PULSES_DATABASE"
-INPUT_FILE = PULSES_DATABASE / "dqe_gate_positiveJ_pulses.npz"
+INPUT_FILE = PULSES_DATABASE / "sqe_state_initstate_bell_positiveJ_pulses.npz"
 
 OUTDIR = Path(__file__).resolve().parent
 PLOT_PREFIX = INPUT_FILE.stem
@@ -41,11 +29,32 @@ ENTANGLEMENT_STAT = "avg"
 
 
 # =============================================================================
+# Editable plot settings
+# =============================================================================
+
+FIGSIZE = (14.5, 4.8)
+DPI = 300
+
+TITLE_FONTSIZE = 15
+LABEL_FONTSIZE = 13
+TICK_FONTSIZE = 12
+CBAR_LABEL_FONTSIZE = 12
+CBAR_TICK_FONTSIZE = 11
+LEGEND_FONTSIZE = 11
+
+MET_LINEWIDTH = 2.2
+GRID_ALPHA = 0.25
+
+# Colourbars
+CBAR_SIZE = "3.5%"
+CBAR_PAD = 0.18
+
+
+# =============================================================================
 # Array helpers
 # =============================================================================
 
 def get_array(raw, *names):
-    """Return the first of *names* that exists in *raw.files*."""
     for name in names:
         if name in raw.files:
             return raw[name]
@@ -53,7 +62,6 @@ def get_array(raw, *names):
 
 
 def infer_database_kind(raw) -> str:
-    """Distinguish state databases (s_avg/s_max) from gate databases (ent_avg/ent_max)."""
     if "ent_s_avg" in raw.files or "ent_s_max" in raw.files:
         return "state"
     if "ent_ent_avg" in raw.files or "ent_ent_max" in raw.files:
@@ -62,13 +70,6 @@ def infer_database_kind(raw) -> str:
 
 
 def get_entanglement_arrays(raw, kind: str):
-    """
-    Return baseline and TEM entanglement arrays plus colorbar labels.
-
-    Returns
-    -------
-    before_ent_all, after_ent_all, shared_cbar, reduction_cbar, reduction_title
-    """
     if kind == "state":
         if ENTANGLEMENT_STAT == "avg":
             before_ent_all = get_array(raw, "baseline_s_avg", "baseline_s_max")
@@ -92,7 +93,6 @@ def get_entanglement_arrays(raw, kind: str):
             reduction_title = "(c) Maximum reduction in unitary entanglement"
         else:
             raise ValueError("ENTANGLEMENT_STAT must be 'avg' or 'max'.")
-
     else:
         raise ValueError(kind)
 
@@ -105,29 +105,17 @@ def get_entanglement_arrays(raw, kind: str):
 
 
 def select_before_from_raw(raw, before_ent_all: np.ndarray):
-    """
-    For each (theta, T), select the init with the lowest finite baseline infidelity.
-
-    Returns
-    -------
-    before_infid : (n_theta, n_T), clipped to INFIDELITY_FLOOR.
-    before_ent   : (n_theta, n_T), entanglement at the selected init.
-    """
     baseline_final_infids = raw["baseline_final_infids"]
 
-    # E3 fix: vectorised argmin replaces the double Python loop.
-    # Replace NaN with inf so argmin selects the smallest finite value.
     filled = np.where(np.isfinite(baseline_final_infids), baseline_final_infids, np.inf)
-    k_best = np.argmin(filled, axis=2)  # (n_theta, n_T)
+    k_best = np.argmin(filled, axis=2)
 
-    # Fancy-index the 3D arrays using the best-k indices.
     i_idx = np.arange(baseline_final_infids.shape[0])[:, None]
     j_idx = np.arange(baseline_final_infids.shape[1])[None, :]
 
     before_infid = baseline_final_infids[i_idx, j_idx, k_best]
     before_ent = before_ent_all[i_idx, j_idx, k_best]
 
-    # Where all inits were non-finite, argmin is arbitrary; restore NaN.
     all_non_finite = ~np.any(np.isfinite(baseline_final_infids), axis=2)
     before_infid[all_non_finite] = np.nan
     before_ent[all_non_finite] = np.nan
@@ -136,12 +124,6 @@ def select_before_from_raw(raw, before_ent_all: np.ndarray):
 
 
 def local_tem_selection_at_point(ent_infids: np.ndarray, ent_values: np.ndarray, threshold: float):
-    """
-    Select the best TEM init at a single (theta, T) grid point.
-
-    Priority: (1) lowest entanglement among successful runs, (2) lowest
-    infidelity among all finite runs, (3) -1 if nothing finite.
-    """
     finite = np.isfinite(ent_infids) & np.isfinite(ent_values)
     successful = finite & (ent_infids <= threshold)
 
@@ -160,16 +142,6 @@ def local_tem_selection_at_point(ent_infids: np.ndarray, ent_values: np.ndarray,
 
 
 def select_after_from_raw(raw, after_ent_all: np.ndarray, threshold: float):
-    """
-    Select TEM results using the MET-override logic: once a T gives a successful
-    low-entanglement result, that result carries forward to larger T.
-
-    Returns
-    -------
-    after_infid : (n_theta, n_T)
-    after_ent   : (n_theta, n_T)
-    after_uses_successful_override : (n_theta, n_T) bool
-    """
     ent_final_infids = raw["ent_final_infids"]
     n_theta, n_T, _ = ent_final_infids.shape
 
@@ -183,7 +155,9 @@ def select_after_from_raw(raw, after_ent_all: np.ndarray, threshold: float):
 
         for j in range(n_T):
             k_local, local_success = local_tem_selection_at_point(
-                ent_final_infids[i, j], after_ent_all[i, j], threshold,
+                ent_final_infids[i, j],
+                after_ent_all[i, j],
+                threshold,
             )
 
             if local_success:
@@ -209,10 +183,6 @@ def select_after_from_raw(raw, after_ent_all: np.ndarray, threshold: float):
 
 
 def extract_met_line(infid: np.ndarray, durations_ns: np.ndarray, threshold: float) -> np.ndarray:
-    """
-    For each theta, return the first T at which infidelity < threshold.
-    Uses np.argmax on a boolean mask, which returns the first True index.
-    """
     met = np.full(infid.shape[0], np.nan)
     for i in range(infid.shape[0]):
         valid = np.isfinite(infid[i]) & (infid[i] <= threshold)
@@ -221,17 +191,20 @@ def extract_met_line(infid: np.ndarray, durations_ns: np.ndarray, threshold: flo
     return met
 
 
-def plot_met_line(ax, theta_pi: np.ndarray, met: np.ndarray, label: str, color: str,
-                  linestyle: str = "--") -> None:
-    """Overlay a MET line on an existing axes, skipping NaN theta values."""
+def plot_met_line(ax, theta_pi: np.ndarray, met: np.ndarray, label: str, color: str):
     valid = np.isfinite(met)
     if np.any(valid):
-        ax.plot(theta_pi[valid], met[valid],
-                color=color, linestyle=linestyle, linewidth=2.2, label=label)
+        ax.plot(
+            theta_pi[valid],
+            met[valid],
+            color=color,
+            linestyle="--",
+            linewidth=MET_LINEWIDTH,
+            label=label,
+        )
 
 
-def finite_minmax(*arrays) -> tuple[float | None, float | None]:
-    """Global min and max over all finite values across multiple arrays."""
+def finite_minmax(*arrays):
     values = []
     for arr in arrays:
         arr = np.asarray(arr, dtype=float)
@@ -244,7 +217,6 @@ def finite_minmax(*arrays) -> tuple[float | None, float | None]:
 
 
 def symmetric_absmax(arr: np.ndarray) -> float:
-    """Max absolute finite value; returns 1.0 if none finite or all zero."""
     arr = np.asarray(arr, dtype=float)
     if not np.any(np.isfinite(arr)):
         return 1.0
@@ -258,6 +230,38 @@ def symmetric_absmax(arr: np.ndarray) -> float:
 # Plotting
 # =============================================================================
 
+def add_full_height_colorbar(fig, ax, im, label: str):
+    """
+    Colourbar exactly matching the height of the plot.
+    """
+    divider = make_axes_locatable(ax)
+
+    cax = divider.append_axes(
+        "right",
+        size=CBAR_SIZE,
+        pad=CBAR_PAD,
+    )
+
+    cbar = fig.colorbar(im, cax=cax)
+
+    cbar.set_label(
+        label,
+        fontsize=CBAR_LABEL_FONTSIZE,
+    )
+
+    cbar.ax.tick_params(
+        labelsize=CBAR_TICK_FONTSIZE
+    )
+
+    return cbar
+
+
+def apply_axis_style(ax):
+    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+    ax.grid(True, alpha=GRID_ALPHA, linestyle="--")
+    ax.set_box_aspect(1)
+
+
 def plot_three_panel(
     X: np.ndarray,
     Y: np.ndarray,
@@ -266,33 +270,26 @@ def plot_three_panel(
     outfile: Path,
     shared_left_middle_cbar: bool = False,
 ) -> None:
-    """
-    Create a 1×3 heatmap figure and save it.
 
-    Parameters
-    ----------
-    X, Y          : meshgrid arrays for pcolormesh (theta/pi, duration).
-    theta_pi      : 1D theta values (for MET line).
-    panels        : list of dicts with keys z, title, cbar, cmap, vmin, vmax,
-                    optionally before_met and after_met.
-    outfile       : output PNG path.
-    shared_left_middle_cbar : if True, panels[0] and [1] share one colorbar.
+    fig = plt.figure(figsize=FIGSIZE)
 
-    B8 fix: constrained_layout=True replaces all manual colorbar positioning.
-    """
-    # B8 fix: constrained_layout=True lets matplotlib handle colorbar sizing.
-    fig, axes = plt.subplots(
-        1, 3,
-        figsize=(15, 4.8),
-        constrained_layout=True,
-        sharey=True,
-    )
+    # [left, bottom, width, height]
+    ax_positions = [
+        [0.07, 0.15, 0.255, 0.72],   # panel (a)
+        [0.350, 0.15, 0.255, 0.72],  # panel (b), close to (a)
+        [0.700, 0.15, 0.255, 0.72],  # panel (c), further from (b)
+    ]
 
+    cbar_width = 0.012
+    cbar_pad = 0.010
+
+    axes = [fig.add_axes(pos) for pos in ax_positions]
     images = []
 
-    for i_ax, (ax, panel) in enumerate(zip(axes, panels)):
+    for ax, panel in zip(axes, panels):
         im = ax.pcolormesh(
-            X, Y,
+            X,
+            Y,
             np.ma.masked_invalid(panel["z"].T),
             shading="auto",
             cmap=panel["cmap"],
@@ -306,25 +303,46 @@ def plot_three_panel(
         if panel.get("after_met") is not None:
             plot_met_line(ax, theta_pi, panel["after_met"], "MET (TEM)", "cyan")
 
-        ax.set_title(panel["title"])
-        ax.set_xlabel(r"Excitation strength $\theta/\pi$")
-        ax.grid(True, alpha=0.25, linestyle="--")
-        ax.set_box_aspect(1)
+        ax.set_title(panel["title"], fontsize=TITLE_FONTSIZE)
+        ax.set_xlabel(r"Excitation strength $\theta/\pi$", fontsize=LABEL_FONTSIZE)
+        ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+        ax.grid(True, alpha=GRID_ALPHA, linestyle="--")
 
         if panel.get("before_met") is not None or panel.get("after_met") is not None:
-            ax.legend(frameon=True)
+            ax.legend(frameon=True, fontsize=LEGEND_FONTSIZE)
 
-    axes[0].set_ylabel(r"Pulse duration $T$ / ns")
+    axes[0].set_ylabel(r"Pulse duration $T$ / ns", fontsize=LABEL_FONTSIZE)
 
+    # Hide repeated y tick labels
+    for ax in axes[1:]:
+        ax.tick_params(labelleft=False)
+
+    # Colourbars exactly same height as corresponding plot
     if shared_left_middle_cbar:
-        # Shared colorbar spanning axes[0] and axes[1]; right panel gets its own.
-        fig.colorbar(images[1], ax=axes[:2], label=panels[0]["cbar"])
-        fig.colorbar(images[2], ax=axes[2], label=panels[2]["cbar"])
+        cbar_items = [
+            (axes[1], images[1], panels[0]["cbar"]),
+            (axes[2], images[2], panels[2]["cbar"]),
+        ]
     else:
-        for ax, im, panel in zip(axes, images, panels):
-            fig.colorbar(im, ax=ax, label=panel["cbar"])
+        cbar_items = [
+            (axes[0], images[0], panels[0]["cbar"]),
+            (axes[1], images[1], panels[1]["cbar"]),
+            (axes[2], images[2], panels[2]["cbar"]),
+        ]
 
-    fig.savefig(outfile, dpi=300)
+    for ax, im, label in cbar_items:
+        pos = ax.get_position()
+        cax = fig.add_axes([
+            pos.x1 + cbar_pad,
+            pos.y0,
+            cbar_width,
+            pos.height,
+        ])
+        cbar = fig.colorbar(im, cax=cax)
+        cbar.set_label(label, fontsize=CBAR_LABEL_FONTSIZE)
+        cbar.ax.tick_params(labelsize=CBAR_TICK_FONTSIZE)
+
+    fig.savefig(outfile, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved plot to\n{outfile}")
 
@@ -352,13 +370,18 @@ def main() -> None:
     X, Y = np.meshgrid(theta_pi, durations_ns)
 
     (
-        before_ent_all, after_ent_all,
-        shared_ent_cbar, reduction_ent_cbar, reduction_ent_title,
+        before_ent_all,
+        after_ent_all,
+        shared_ent_cbar,
+        reduction_ent_cbar,
+        reduction_ent_title,
     ) = get_entanglement_arrays(raw, kind)
 
     before_infid, before_ent = select_before_from_raw(raw, before_ent_all)
     after_infid, after_ent, after_uses_successful_override = select_after_from_raw(
-        raw, after_ent_all, threshold,
+        raw,
+        after_ent_all,
+        threshold,
     )
 
     before_met = extract_met_line(before_infid, durations_ns, threshold)
@@ -371,31 +394,48 @@ def main() -> None:
     infid_vmin, infid_vmax = finite_minmax(log_before_infid, log_after_infid)
     delta_abs = symmetric_absmax(delta_log_infid)
 
-    # --- Infidelity three-panel ---
     plot_three_panel(
-        X, Y, theta_pi,
+        X,
+        Y,
+        theta_pi,
         panels=[
-            dict(z=log_before_infid, title="(a) Baseline",
-                 cbar=r"$\log_{10}(\mathrm{infidelity})$",
-                 cmap="inferno", vmin=infid_vmin, vmax=infid_vmax,
-                 before_met=before_met),
-            dict(z=log_after_infid, title="(b) TEM",
-                 cbar=r"$\log_{10}(\mathrm{infidelity})$",
-                 cmap="inferno", vmin=infid_vmin, vmax=infid_vmax,
-                 after_met=after_met),
-            dict(z=delta_log_infid, title="(c) Infidelity ratio",
-                 cbar=r"-$\Delta \log_{10}(\mathrm{infidelity})$",
-                 cmap="coolwarm", vmin=-delta_abs, vmax=delta_abs,
-                 before_met=before_met, after_met=after_met),
+            dict(
+                z=log_before_infid,
+                title="(a) Baseline",
+                cbar=r"$\log_{10}(\mathrm{infidelity})$",
+                cmap="inferno",
+                vmin=infid_vmin,
+                vmax=infid_vmax,
+                before_met=before_met,
+            ),
+            dict(
+                z=log_after_infid,
+                title="(b) TEM",
+                cbar=r"$\log_{10}(\mathrm{infidelity})$",
+                cmap="inferno",
+                vmin=infid_vmin,
+                vmax=infid_vmax,
+                after_met=after_met,
+            ),
+            dict(
+                z=delta_log_infid,
+                title="(c) Infidelity ratio",
+                cbar=r"-$\Delta \log_{10}(\mathrm{infidelity})$",
+                cmap="coolwarm",
+                vmin=-delta_abs,
+                vmax=delta_abs,
+                before_met=before_met,
+                after_met=after_met,
+            ),
         ],
         outfile=OUTDIR / f"{PLOT_PREFIX}_ent_infidelity_three_panel_met.png",
         shared_left_middle_cbar=False,
     )
 
-    # --- Normalise entanglement to [0, 1] ---
     ent_norm = np.nanmax([np.nanmax(before_ent), np.nanmax(after_ent)])
     if not np.isfinite(ent_norm) or ent_norm == 0.0:
         ent_norm = 1.0
+
     before_ent = before_ent / ent_norm
     after_ent = after_ent / ent_norm
     reduction_ent = before_ent - after_ent
@@ -403,25 +443,42 @@ def main() -> None:
     ent_vmin, ent_vmax = finite_minmax(before_ent, after_ent)
     red_abs = 1.0
 
-    # --- Entanglement three-panel ---
     plot_three_panel(
-        X, Y, theta_pi,
+        X,
+        Y,
+        theta_pi,
         panels=[
-            dict(z=before_ent, title="(a) Baseline",
-                 cbar=r"$\overline{S}_{\rm transient}$",
-                 cmap="viridis", vmin=ent_vmin, vmax=ent_vmax,
-                 before_met=before_met),
-            dict(z=after_ent, title="(b) TEM",
-                 cbar=r"$\overline{S}_{\rm transient}$",
-                 cmap="viridis", vmin=ent_vmin, vmax=ent_vmax,
-                 after_met=after_met),
-            dict(z=reduction_ent, title=reduction_ent_title,
-                 cbar=(
-                     r"$\overline{S}_{\rm transient}"
-                     r"-\overline{S}^{\rm TEM}_{\rm transient}$"
-                 ),
-                 cmap="coolwarm", vmin=-red_abs, vmax=red_abs,
-                 before_met=before_met, after_met=after_met),
+            dict(
+                z=before_ent,
+                title="(a) Baseline",
+                cbar=r"$\overline{S}_{\rm transient}$",
+                cmap="viridis",
+                vmin=ent_vmin,
+                vmax=ent_vmax,
+                before_met=before_met,
+            ),
+            dict(
+                z=after_ent,
+                title="(b) TEM",
+                cbar=r"$\overline{S}_{\rm transient}$",
+                cmap="viridis",
+                vmin=ent_vmin,
+                vmax=ent_vmax,
+                after_met=after_met,
+            ),
+            dict(
+                z=reduction_ent,
+                title=reduction_ent_title,
+                cbar=(
+                    r"$\overline{S}_{\rm transient}"
+                    r"-\overline{S}^{\rm TEM}_{\rm transient}$"
+                ),
+                cmap="coolwarm",
+                vmin=-red_abs,
+                vmax=red_abs,
+                before_met=before_met,
+                after_met=after_met,
+            ),
         ],
         outfile=OUTDIR / f"{PLOT_PREFIX}_entanglement_three_panel_met.png",
         shared_left_middle_cbar=True,
